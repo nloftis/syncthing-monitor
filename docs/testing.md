@@ -26,9 +26,22 @@ Stage 1 coverage includes:
 - notification queue ordering and retry behavior;
 - event-batch ordering, cursor advancement, persistence, and failure handling.
 
-The event-batch tests intentionally preserve the Stage 1 behavior of persisting
-state after each successfully processed event. Later redesign stages may change
-that behavior and must update the corresponding tests deliberately.
+Stage 3 deliberately replaces the Stage 1 per-event persistence behavior.
+Event batches are now processed in memory and persisted once after the batch.
+
+Stage 3 automated coverage verifies:
+
+- ordered event-batch processing and once-per-batch persistence;
+- malformed event payloads are skipped without blocking later valid events;
+- only monitored-folder `RemoteChangeDetected` file deletions are eligible;
+- remote additions, modifications, and directory deletions are ignored;
+- the rolling deletion window excludes events older than the configured window;
+- threshold crossing sends one initial incident notification;
+- post-threshold deletions contribute to the final incident count;
+- wall-clock quiet-period checks close active incidents;
+- normal monitor restart preserves persisted active-incident state;
+- Syncthing restart closes an active incident with its persisted pre-restart
+  count before resetting the event baseline.
 
 Stage 2 adds automated coverage for the count-based Receive Only evaluator and
 its integration with status polling.

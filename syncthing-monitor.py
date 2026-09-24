@@ -324,9 +324,11 @@ def incident(s, fid):
 
 def remote_delete(s, ev):
     d = ev.get("data", {})
+    if not isinstance(d, dict):
+        raise ValueError("RemoteChangeDetected data must be an object")
     if d.get("action") != "deleted" or d.get("type") != "file": return
     fid = d.get("folder") or d.get("folderID")
-    if not fid: return
+    if not fid or fid not in FOLDERS: return
     ts, path = event_epoch(ev["time"]), d.get("path", "(unknown)")
     inc = incident(s, fid)
     q = deque((float(t), p) for t, p in inc.get("events", []))
@@ -354,6 +356,29 @@ def remote_delete(s, ev):
     elif len(q) >= max(1, REMOTE_DELETE_THRESHOLD // 2):
         log(f"remote deletion activity: {label(fid, d)} ({len(q)}/{REMOTE_DELETE_THRESHOLD})")
 
+def queue_incident_close(s, fid, inc, reason):
+    total = int(inc.get("burstTotal", 0))
+    first = inc.get("firstTime")
+    last = inc.get("lastTime")
+    duration = (
+        max(0, int(float(last) - float(first)))
+        if first is not None and last is not None
+        else 0
+    )
+    if reason == "restart":
+        status = "Syncthing restarted; closing the active incident."
+    else:
+        status = "The incident is quiet."
+    queue_notice(
+        s,
+        f"[Syncthing] remote deletion burst ended — {label(fid)}",
+        f"Remote deletion incident for '{label(fid)}': {status}\n"
+        f"Total observed file deletions: {total}\n"
+        f"Observed duration: {duration} seconds\n\n"
+        "Review the live folder and .stversions before recovery.",
+    )
+
+
 def close_quiet_incidents(s):
     now, changed = time.time(), False
     for fid, inc in list(s["remoteDeletes"].items()):
@@ -361,13 +386,7 @@ def close_quiet_incidents(s):
         last = inc.get("lastTime")
         if last is None or now - float(last) < REMOTE_DELETE_WINDOW: continue
         total = int(inc.get("burstTotal", 0))
-        first = inc.get("firstTime")
-        duration = max(0, int(float(last) - float(first))) if first is not None else 0
-        queue_notice(s, f"[Syncthing] remote deletion burst ended — {label(fid)}",
-                     f"Remote deletion incident for '{label(fid)}' is quiet.\n"
-                     f"Total observed file deletions: {total}\n"
-                     f"Observed duration: {duration} seconds\n\n"
-                     "Review the live folder and .stversions before recovery.")
+        queue_incident_close(s, fid, inc, "quiet")
         s["remoteDeletes"][fid] = {
             "events": [], "active": False, "burstTotal": 0,
             "firstTime": None, "lastTime": None, "samplePaths": []
@@ -384,17 +403,17 @@ def process_event_batch(s, events):
     for event in events:
         try:
             process_event(s, event)
-            s["lastEventId"] = int(event["id"])
-            atomic_save(s)
-        except Exception as e:
-            log(
-                f"event {event.get('id', '?')} failed; "
-                f"cursor not advanced: {e}"
-            )
-            break
+        except (KeyError, TypeError, ValueError) as e:
+            log(f"event {event.get('id', '?')} malformed; skipped: {e}")
+        s["lastEventId"] = int(event["id"])
+    if events:
+        atomic_save(s)
 
 def restart(s, new_st):
     log("Syncthing restart detected; resetting cursor for new process")
+    for fid, inc in s["remoteDeletes"].items():
+        if inc.get("active"):
+            queue_incident_close(s, fid, inc, "restart")
     s["syncthingStartTime"], s["lastEventId"], s["remoteDeletes"] = new_st, 0, {}
     atomic_save(s)
     check_receive_only(s, True)

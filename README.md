@@ -59,7 +59,11 @@ Authoritative systems
 +---------------------------+
 ```
 
-The monitor uses two independent mechanisms.
+The runtime monitor uses two independent mechanisms.
+
+Automated regression coverage lives under `tests/` and exercises configuration,
+state persistence, notification handling, Receive Only evaluation, and event
+processing independently of the deployed container.
 
 ### Receive Only state polling
 
@@ -93,6 +97,11 @@ RemoteChangeDetected
 ```
 
 The event cursor is persisted across monitor restarts.
+
+Event batches are processed in memory and persisted once after the batch.
+Malformed event payloads are logged and skipped so that a single bad event
+does not indefinitely block later events. Events for folders outside the
+configured monitored set are ignored.
 
 Events are not used to determine Receive Only divergence. They are retained
 for remote-deletion audit information that `/rest/db/status` does not
@@ -283,9 +292,9 @@ For a new deployment, the monitor creates fresh state automatically.
 
 ## Restart Behavior
 
-If the monitor container restarts while the Syncthing process remains unchanged, it resumes the combined event stream from its persisted event cursor.
+If the monitor container restarts while the Syncthing process remains unchanged, it resumes the combined event stream from its persisted event cursor and preserves any active remote-deletion incident.
 
-If Syncthing's reported process start time changes, the monitor treats that as a Syncthing restart and resets its event-stream baseline appropriately.
+If Syncthing's reported process start time changes, the monitor treats that as a Syncthing restart. Any active remote-deletion incident is first closed using its persisted pre-restart count and queued for notification. The monitor then resets the event-stream baseline for the new Syncthing process lifetime.
 
 ## Notification Reliability
 

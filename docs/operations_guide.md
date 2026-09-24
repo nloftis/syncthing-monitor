@@ -132,9 +132,9 @@ The event ID should come from persisted state rather than restarting from zero.
 
 The monitor periodically compares Syncthing's current process start time with the value stored in monitor state.
 
-If Syncthing itself has restarted, the monitor resets its event-stream baseline for the new Syncthing process lifetime.
+If Syncthing itself has restarted, the monitor first closes any active remote-deletion incident using the persisted pre-restart count and queues the closing notification. It then resets its event-stream baseline for the new Syncthing process lifetime.
 
-This is different from merely restarting the monitor container.
+This is different from merely restarting the monitor container, which preserves the active incident and resumes from the persisted event cursor.
 
 ## Configuration Changes
 

@@ -148,6 +148,39 @@ class StatePersistenceTests(unittest.TestCase):
             receive_only_state,
         )
 
+    def test_normalize_state_preserves_active_remote_delete_incident(self):
+        folder_id = "test-folder"
+        remote_delete_state = {
+            "events": [
+                [1790251200.0, "one.txt"],
+                [1790251210.0, "two.txt"],
+            ],
+            "active": True,
+            "burstTotal": 57,
+            "firstTime": 1790251200.0,
+            "lastTime": 1790251210.0,
+            "samplePaths": ["one.txt", "two.txt"],
+        }
+        state = {
+            "version": 4,
+            "syncthingStartTime": "example",
+            "lastEventId": 350,
+            "receiveOnly": {folder_id: None},
+            "remoteDeletes": {
+                folder_id: remote_delete_state.copy(),
+            },
+            "pendingNotifications": [],
+        }
+
+        with patch.object(monitor, "FOLDERS", {folder_id: "Test Folder"}):
+            normalized = monitor.normalize_state(state)
+
+        self.assertEqual(
+            normalized["remoteDeletes"][folder_id],
+            remote_delete_state,
+        )
+        self.assertEqual(normalized["lastEventId"], 350)
+
     def test_fresh_state_has_no_receive_only_observation(self):
         folder_id = "test-folder"
 
