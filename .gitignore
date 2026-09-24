@@ -1,0 +1,26 @@
+# Editor / OS artifacts
+.DS_Store
+*~
+*.swp
+*.swo
+
+# Synology metadata
+@eaDir/
+@SynoResource
+@SynoEAStream
+.SynoResource
+
+# Secrets: real values live only in .env (template is .env.example)
+.env
+.env.*
+!.env.example
+
+# Runtime state
+state/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Previous versions
+archive/
