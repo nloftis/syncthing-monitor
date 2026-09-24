@@ -59,72 +59,97 @@ Authoritative systems
 +---------------------------+
 ```
 
-The monitor uses two complementary mechanisms.
+The monitor uses two independent mechanisms.
 
 ### Receive Only state polling
 
-The monitor periodically queries:
+The monitor queries every monitored folder every 60 seconds:
 
 ```text
 /rest/db/status?folder=<folder-id>
 ```
 
-The Receive Only counters returned by this endpoint are treated as the authoritative persistent indication that the NAS copy has diverged locally.
+The Receive Only counters returned by this endpoint are the authoritative
+indication that the NAS copy has diverged locally.
 
-The default production polling interval is:
+The production polling interval is:
 
 ```text
-STATUS_INTERVAL=900 (or 15 minutes.)
+STATUS_INTERVAL=60
 ```
 
-This relatively conservative interval is intentional because Syncthing documents database status queries as potentially expensive.
+Testing on the DS224+ measured idle `/rest/db/status` calls at approximately
+0.0012–0.0013 seconds each. A stress test at roughly 240 calls per minute,
+about 60 times the proposed production request rate, showed no concerning
+sustained idle load. Status-call cost during active synchronization remains
+unresolved.
 
 ### Syncthing event stream
 
-The monitor also consumes the combined Syncthing event stream for:
+The monitor consumes the combined Syncthing event stream for:
 
 ```text
-LocalChangeDetected
 RemoteChangeDetected
 ```
 
 The event cursor is persisted across monitor restarts.
 
-Events are used as an **accelerator**, not as the authoritative representation of Receive Only state.
-
-When a `LocalChangeDetected` event occurs for a monitored folder, the monitor immediately checks that folder's Receive Only state. The event itself does not independently generate a local-change notification.
-
-This design prevents the event path and scheduled database-status path from independently sending duplicate alerts for the same Receive Only incident.
+Events are not used to determine Receive Only divergence. They are retained
+for remote-deletion audit information that `/rest/db/status` does not
+provide.
 
 ## Receive Only Detection
 
-Receive Only monitoring is state-based rather than change-count based.
-
-The state transition model is:
+Receive Only monitoring is count-based. For each monitored folder, the
+monitor persists:
 
 ```text
-clean
-  |
-  | Receive Only divergence detected
-  v
-dirty  ----> send one notification
-  |
-  | additional local changes
-  v
-dirty  ----> no repeated state notification
-  |
-  | manual recovery / Revert Local Changes
-  v
-clean  ----> detector rearmed
+receiveOnlyChangedFiles
+receiveOnlyChangedDirectories
+receiveOnlyChangedSymlinks
+receiveOnlyChangedDeletes
+receiveOnlyChangedBytes
+receiveOnlyTotalItems
 ```
 
-Multiple local changes while a folder remains dirty are treated as **one integrity incident**.
+`receiveOnlyTotalItems` is authoritative for divergence:
 
-The monitor does not attempt to provide a per-file audit trail of every local change.
+```text
+receiveOnlyTotalItems == 0  -> clean
+receiveOnlyTotalItems > 0   -> divergent
+```
 
-## LocalChangeDetected Behavior
+The component counters are retained for diagnostic context but do not
+independently define whether the folder is divergent.
 
-Testing with Syncthing 2.0.10 demonstrated that `LocalChangeDetected` should not be relied upon as the sole detector of Receive Only divergence.
+The monitor also tracks the last observed divergence count and the count and
+time associated with the last alert. This distinguishes several transitions:
+
+```text
+0 -> >0       initial divergence; alert
+>0 -> larger  divergence worsened
+>0 -> same    unchanged; silent
+>0 -> smaller partial recovery; silent
+>0 -> 0       full recovery; silent and rearm
+```
+
+If the monitor has no prior Receive Only observation and the first successful
+status check is already divergent, it alerts rather than silently adopting
+the pre-existing divergence.
+
+Every observed count change is persisted. Worsening divergence is currently
+recorded as a worsening candidate, but a separate worsening notification is
+not yet emitted because the minimum notification-coalescing interval remains
+unresolved.
+
+A failed status request is treated as an unknown observation, not as a clean
+folder. The monitor retains the last known Receive Only state and waits for a
+successful status check before evaluating another transition.
+
+## Why Receive Only Detection Does Not Use LocalChangeDetected
+
+Testing with Syncthing 2.0.10 showed that `LocalChangeDetected` is not a
+reliable trigger for Receive Only divergence.
 
 Observed behavior included:
 
@@ -134,13 +159,12 @@ Observed behavior included:
 | NAS-local modification of synchronized file | Dirty | No prompt event observed |
 | Revert Local Changes deleting NAS-local divergence | Clean | Yes |
 
-For both the local-addition and local-modification tests, Syncthing recognized the divergence promptly in its Receive Only database state even though no corresponding `LocalChangeDetected` event was observed.
+For both the local-addition and local-modification tests, Syncthing recognized
+the divergence promptly in its Receive Only database state even though no
+corresponding `LocalChangeDetected` event was observed.
 
-For this reason:
-
-> `/rest/db/status` is the authoritative persistent detector. `LocalChangeDetected` is an opportunistic accelerator.
-
-A useful event can cause detection or rearming sooner than the next scheduled status check, but correctness does not depend on every local change producing an event.
+The monitor therefore does not subscribe to `LocalChangeDetected`.
+`/rest/db/status` polling is the sole Receive Only detection mechanism.
 
 ## Remote Mass-Deletion Detection
 
@@ -187,17 +211,35 @@ The current remote detector intentionally focuses on **mass file deletion**.
 
 ## Important Limitation: Transient Local Divergence
 
-Receive Only polling detects persistent divergence.
+Receive Only polling detects divergence that Syncthing has discovered and
+that is still present when the monitor polls `/rest/db/status`.
 
-An edge case exists when all of the following occur:
+With the Syncthing filesystem watcher operating normally, the monitor checks
+each protected folder every 60 seconds. A local divergence discovered by
+Syncthing should therefore normally become visible to the monitor within
+roughly one polling interval.
 
-1. A folder becomes locally dirty.
-2. No useful `LocalChangeDetected` event is emitted.
-3. The divergence is completely resolved before the next scheduled `/rest/db/status` check.
+A transient edge case still exists when all of the following occur:
 
-In that case, the monitor may never observe the dirty state.
+1. A folder becomes locally divergent.
+2. Syncthing discovers the divergence.
+3. The divergence is completely resolved before the monitor's next
+   `/rest/db/status` poll.
 
-The monitor should therefore be considered an integrity-warning mechanism, not a complete filesystem audit system.
+In that case, the monitor may never observe the divergent state.
+
+There is a separate discovery limitation. If Syncthing's filesystem watcher
+fails or otherwise does not discover a local change promptly, the Receive
+Only counters may remain unchanged until Syncthing discovers the change by
+another mechanism, potentially including a later full rescan. The production
+folders currently use a 3600-second rescan interval.
+
+The 60-second monitor interval therefore bounds how often the monitor
+observes Syncthing's database state; it does not guarantee that Syncthing
+itself discovers every filesystem change within 60 seconds.
+
+The monitor should be considered an integrity-warning mechanism, not a
+complete filesystem audit system.
 
 ## Recovery
 
@@ -342,7 +384,7 @@ REMOTE_DELETE_WINDOW=300
 The production Receive Only status interval is:
 
 ```text
-STATUS_INTERVAL=900
+STATUS_INTERVAL=60
 ```
 
 ## Security

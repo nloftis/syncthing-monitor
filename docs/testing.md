@@ -30,8 +30,34 @@ The event-batch tests intentionally preserve the Stage 1 behavior of persisting
 state after each successfully processed event. Later redesign stages may change
 that behavior and must update the corresponding tests deliberately.
 
-The legacy `LocalChangeDetected` Receive Only path is not covered by the new
-Stage 1 regression suite because the Stage 2 design removes that path.
+Stage 2 adds automated coverage for the count-based Receive Only evaluator and
+its integration with status polling.
+
+Stage 2 Receive Only coverage includes:
+
+- clean startup baseline;
+- startup with pre-existing divergence;
+- clean-to-divergent transition;
+- unchanged divergence;
+- worsening divergence;
+- component-counter changes with an unchanged total count;
+- partial recovery;
+- full recovery and rearming;
+- comparison with the last known state after an unknown API observation;
+- preservation of the last known state when `/rest/db/status` fails;
+- migration of legacy Boolean Receive Only state;
+- preservation of structured Stage 2 Receive Only state.
+
+The tests use a sanitized `/rest/db/status` fixture captured from the actual
+Syncthing 2.0.10 deployment for the clean response shape. Divergent
+observations used by the evaluator tests are derived synthetically from that
+fixture rather than represented as live-captured production responses.
+
+Stage 2 removes `LocalChangeDetected` from the monitor's Receive Only
+detection path. The historical acceptance tests below are retained because
+they document the Syncthing 2.0.10 behavior that motivated that design
+change; descriptions of v4 event-assisted behavior should not be read as
+descriptions of the current Stage 2 implementation.
 
 ---
 
@@ -135,19 +161,32 @@ This is not intended to provide a per-file local-change audit trail.
 
 ## Transient Divergence Limitation
 
+The Stage 2 Receive Only detector polls `/rest/db/status` every 60 seconds.
+
 A known architectural blind spot remains:
 
 ```text
 clean
-  -> local divergence
-  -> no useful LocalChangeDetected event
-  -> divergence completely resolved
+  -> Syncthing discovers local divergence
+  -> divergence completely resolves
   -> next scheduled DB poll
 ```
 
-If the entire dirty period occurs between database-status polls, the monitor may never observe it.
+If the entire divergent period occurs between database-status polls, the
+monitor may never observe it.
 
-**Result: Known limitation — accepted.**
+There is a separate Syncthing discovery limitation. The monitor can only
+observe Receive Only state that Syncthing has already discovered. With the
+filesystem watcher operating normally, a discovered divergence should become
+visible to the monitor within roughly one 60-second polling interval.
+
+If the filesystem watcher fails or otherwise does not discover a local change
+promptly, the Receive Only counters may not reflect the change until Syncthing
+discovers it by another mechanism, potentially including a later full rescan.
+The production folders currently use a 3600-second rescan interval.
+
+**Result: Known limitation — accepted. The 60-second interval bounds monitor
+observation frequency, not Syncthing filesystem-discovery latency.**
 
 ## Remote File Deletion Detection
 
@@ -254,7 +293,51 @@ Pending notifications persisted in monitor state and survived container recreati
 
 **Result: PASS — transient notification failure does not discard queued notification state.**
 
-## Production Acceptance State
+## Stage 2 Production Acceptance
+
+Stage 2 was deployed to the existing Synology monitor container without
+modifying production backup data.
+
+Before deployment, all four monitored Receive Only folders reported a clean
+state through `/rest/db/status`:
+
+```text
+receiveOnlyChangedFiles=0
+receiveOnlyChangedDirectories=0
+receiveOnlyChangedSymlinks=0
+receiveOnlyChangedDeletes=0
+receiveOnlyChangedBytes=0
+receiveOnlyTotalItems=0
+```
+
+The persisted pre-Stage-2 state contained legacy Boolean `false` values for
+all four Receive Only folders.
+
+After container recreation with the Stage 2 implementation:
+
+- the monitor resumed the existing combined event stream after event ID 350;
+- each legacy Boolean Receive Only value was replaced with structured
+  count-based state from a successful `/rest/db/status` observation;
+- all four folders persisted `lastObservedCount=0`;
+- all six Receive Only counters were persisted for each folder;
+- `lastAlertedCount` and `lastAlertTime` remained unset for the clean baseline;
+- no spurious Receive Only notification was generated during migration;
+- the running container reported `STATUS_INTERVAL=60`;
+- the container remained healthy across multiple polling intervals with no
+  status-check failures or unexpected monitor log messages.
+
+No production Receive Only divergence was manufactured for this acceptance
+test. Dirty-state transition behavior is covered by the automated evaluator
+and integration tests rather than by modifying production backup data.
+
+**Result: PASS — Stage 2 clean-state migration and production polling
+configuration verified without modifying protected backup data.**
+
+## Pre-Stage-2 Production Acceptance State
+
+The following records the production configuration and behavior verified before
+the Stage 2 Receive Only redesign. It is retained as historical acceptance
+evidence and does not describe the current Stage 2 implementation.
 
 At completion of functional testing:
 

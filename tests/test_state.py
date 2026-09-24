@@ -89,5 +89,73 @@ class StatePersistenceTests(unittest.TestCase):
                 original_state,
             )
 
+    def test_normalize_state_migrates_legacy_receive_only_booleans(self):
+        folder_id = "test-folder"
+
+        for legacy_value in (False, True):
+            with self.subTest(legacy_value=legacy_value):
+                state = {
+                    "version": 4,
+                    "syncthingStartTime": "example",
+                    "lastEventId": 123,
+                    "receiveOnly": {
+                        folder_id: legacy_value,
+                    },
+                    "remoteDeletes": {},
+                    "pendingNotifications": [],
+                }
+
+                with patch.object(
+                    monitor,
+                    "FOLDERS",
+                    {folder_id: "Test Folder"},
+                ):
+                    normalized = monitor.normalize_state(state)
+
+                self.assertIsNone(
+                    normalized["receiveOnly"][folder_id]
+                )
+
+    def test_normalize_state_preserves_stage2_receive_only_state(self):
+        folder_id = "test-folder"
+        receive_only_state = {
+            "receiveOnlyChangedFiles": 2,
+            "receiveOnlyChangedDirectories": 0,
+            "receiveOnlyChangedSymlinks": 0,
+            "receiveOnlyChangedDeletes": 0,
+            "receiveOnlyChangedBytes": 100,
+            "receiveOnlyTotalItems": 2,
+            "lastObservedCount": 2,
+            "lastAlertedCount": 2,
+            "lastAlertTime": "2026-09-24T20:00:00+00:00",
+        }
+        state = {
+            "version": 4,
+            "syncthingStartTime": "example",
+            "lastEventId": 123,
+            "receiveOnly": {
+                folder_id: receive_only_state.copy(),
+            },
+            "remoteDeletes": {},
+            "pendingNotifications": [],
+        }
+
+        with patch.object(monitor, "FOLDERS", {folder_id: "Test Folder"}):
+            normalized = monitor.normalize_state(state)
+
+        self.assertEqual(
+            normalized["receiveOnly"][folder_id],
+            receive_only_state,
+        )
+
+    def test_fresh_state_has_no_receive_only_observation(self):
+        folder_id = "test-folder"
+
+        with patch.object(monitor, "FOLDERS", {folder_id: "Test Folder"}):
+            state = monitor.fresh_state("example", 123)
+
+        self.assertIsNone(state["receiveOnly"][folder_id])
+
+
 if __name__ == "__main__":
     unittest.main()

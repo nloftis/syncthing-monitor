@@ -50,7 +50,12 @@ If the authoritative source is confirmed correct, use:
 
 This is a manual recovery action. The integrity monitor never performs it automatically.
 
-Once Syncthing returns the folder to clean Receive Only state, the monitor rearms the folder. When Syncthing emits a useful `LocalChangeDetected` event during recovery, rearming may happen immediately. Otherwise the periodic status check provides the fallback.
+Once Syncthing returns the folder to clean Receive Only state, the next
+successful `/rest/db/status` poll observes `receiveOnlyTotalItems == 0`.
+The monitor then silently rearms the folder so that a future divergence can
+generate a new initial alert. With the production 60-second polling interval,
+this normally occurs within roughly one polling interval after Syncthing
+discovers the recovery.
 
 ## Remote Mass-Deletion Alert
 
@@ -150,7 +155,7 @@ Avoid printing the fully expanded Compose configuration when `.env` contains sec
 The tested production values are:
 
 ```text
-STATUS_INTERVAL=900
+STATUS_INTERVAL=60
 RESTART_CHECK_INTERVAL=60
 REMOTE_DELETE_THRESHOLD=50
 REMOTE_DELETE_WINDOW=300
@@ -168,25 +173,39 @@ Use `.env.example` as the repository-safe configuration reference.
 
 ## Troubleshooting
 
-### Receive Only alert but no LocalChangeDetected event
+### Receive Only divergence detection
 
-This is an observed possibility.
+Receive Only detection does not depend on `LocalChangeDetected`.
 
-Testing showed that Syncthing 2.0.10 could recognize local NAS additions and modifications in Receive Only database state without emitting a prompt `LocalChangeDetected` event.
+Testing with Syncthing 2.0.10 showed that Syncthing could recognize local NAS
+additions and modifications in Receive Only database state without emitting a
+prompt `LocalChangeDetected` event. The monitor therefore uses
+`/rest/db/status` as the sole Receive Only detection mechanism.
 
-The scheduled `/rest/db/status` check is therefore the authoritative fallback.
+The monitor polls every monitored folder every 60 seconds.
 
-### Revert clears the folder before the next scheduled poll
+### Revert clears the folder
 
-If Syncthing emits a `LocalChangeDetected` event for the recovery operation, the monitor immediately checks Receive Only state and can rearm without waiting for the next 15-minute poll.
-
-This behavior was reproduced during acceptance testing.
+When Syncthing reports `receiveOnlyTotalItems == 0`, the monitor silently
+rearms the folder on the next successful status poll. No recovery notification
+is sent.
 
 ### No alert for a very brief local change
 
-A local divergence that appears and completely disappears between scheduled database checks can be missed if no useful event is emitted.
+A local divergence that appears and completely disappears between two
+`/rest/db/status` polls can be missed.
 
-This is a known limitation of the current design.
+There is also a separate Syncthing discovery limitation. If the filesystem
+watcher does not discover a local change promptly, the Receive Only counters
+may not reflect that change until Syncthing discovers it by another mechanism,
+potentially including a later full rescan. The production folders currently
+use a 3600-second rescan interval.
+
+The 60-second polling interval controls how frequently the monitor observes
+Syncthing's database state; it does not guarantee that Syncthing discovers
+every filesystem change within 60 seconds.
+
+These are known limitations of the current design.
 
 ### Large number of RemoteChangeDetected modified events
 

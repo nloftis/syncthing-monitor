@@ -9,8 +9,8 @@ from pathlib import Path
 ST_URL = os.getenv("ST_URL", "http://127.0.0.1:8384").rstrip("/")
 ST_API_KEY = os.getenv("ST_API_KEY", "")
 STATE_FILE = Path(os.getenv("STATE_FILE", "/state/monitor-state.json"))
-EVENT_TYPES = "LocalChangeDetected,RemoteChangeDetected"
-STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", "900"))
+EVENT_TYPES = "RemoteChangeDetected"
+STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", "60"))
 RESTART_CHECK_INTERVAL = int(os.getenv("RESTART_CHECK_INTERVAL", "60"))
 REMOTE_DELETE_THRESHOLD = int(os.getenv("REMOTE_DELETE_THRESHOLD", "50"))
 REMOTE_DELETE_WINDOW = int(os.getenv("REMOTE_DELETE_WINDOW", "300"))
@@ -133,7 +133,7 @@ def newest_event_id():
 def fresh_state(st, last_id):
     return {
         "version": 4, "syncthingStartTime": st, "lastEventId": last_id,
-        "receiveOnly": {fid: False for fid in FOLDERS},
+        "receiveOnly": {fid: None for fid in FOLDERS},
         "remoteDeletes": {}, "pendingNotifications": []
     }
 
@@ -142,7 +142,17 @@ def normalize_state(s):
     s.setdefault("syncthingStartTime", "")
     s.setdefault("lastEventId", 0)
     s.setdefault("receiveOnly", {})
-    for fid in FOLDERS: s["receiveOnly"].setdefault(fid, False)
+
+    for fid in FOLDERS:
+        value = s["receiveOnly"].get(fid)
+        if isinstance(value, bool):
+            # Stage 1 persisted only clean/dirty Boolean state. It cannot
+            # establish the Stage 2 counter baseline, so require a fresh
+            # /rest/db/status observation.
+            s["receiveOnly"][fid] = None
+        elif fid not in s["receiveOnly"]:
+            s["receiveOnly"][fid] = None
+
     s.setdefault("remoteDeletes", {})
     s.setdefault("pendingNotifications", [])
     return s
@@ -195,35 +205,116 @@ def event_epoch(value):
 def label(fid, data=None):
     return FOLDERS.get(fid) or (data or {}).get("label") or fid
 
-def ro_status(fid):
-    x = api("/rest/db/status", {"folder": fid}, timeout=15)
-    keys = ("receiveOnlyChangedFiles", "receiveOnlyChangedDirectories",
-            "receiveOnlyChangedSymlinks", "receiveOnlyChangedDeletes")
-    return sum(int(x.get(k, 0) or 0) for k in keys), int(x.get("receiveOnlyChangedBytes", 0) or 0)
+RECEIVE_ONLY_COUNTERS = (
+    "receiveOnlyChangedFiles",
+    "receiveOnlyChangedDirectories",
+    "receiveOnlyChangedSymlinks",
+    "receiveOnlyChangedDeletes",
+    "receiveOnlyChangedBytes",
+    "receiveOnlyTotalItems",
+)
 
-def check_receive_only(s, force_save=False, only_fid=None):
+def ro_status(fid):
+    status = api("/rest/db/status", {"folder": fid}, timeout=15)
+    return {
+        key: int(status.get(key, 0) or 0)
+        for key in RECEIVE_ONLY_COUNTERS
+    }
+
+def evaluate_receive_only(previous, observation, *, observed_at):
+    current = {
+        key: int(observation.get(key, 0) or 0)
+        for key in RECEIVE_ONLY_COUNTERS
+    }
+    count = current["receiveOnlyTotalItems"]
+
+    previous_count = (
+        None
+        if previous is None
+        else int(previous.get("lastObservedCount", 0))
+    )
+    last_alerted_count = (
+        None if previous is None else previous.get("lastAlertedCount")
+    )
+    last_alert_time = (
+        None if previous is None else previous.get("lastAlertTime")
+    )
+
+    alerts = []
+
+    if previous_count is None:
+        if count > 0:
+            alerts.append("initial")
+            last_alerted_count = count
+            last_alert_time = observed_at
+    elif previous_count == 0 and count > 0:
+        alerts.append("initial")
+        last_alerted_count = count
+        last_alert_time = observed_at
+    elif previous_count > 0 and count > previous_count:
+        alerts.append("worsened")
+    elif previous_count > 0 and count == 0:
+        last_alerted_count = None
+        last_alert_time = None
+
+    current.update({
+        "lastObservedCount": count,
+        "lastAlertedCount": last_alerted_count,
+        "lastAlertTime": last_alert_time,
+    })
+
+    return current, alerts
+
+def check_receive_only(s, force_save=False):
     changed = False
-    folder_ids = [only_fid] if only_fid in FOLDERS else list(FOLDERS)
-    for fid in folder_ids:
+
+    for fid in FOLDERS:
         try:
-            count, nbytes = ro_status(fid)
+            observation = ro_status(fid)
         except Exception as e:
             log(f"status check failed for {label(fid)}: {e}")
             continue
-        dirty = count > 0
-        old = bool(s["receiveOnly"].get(fid, False))
-        if dirty and not old:
-            queue_notice(s, f"[Syncthing] local changes detected — {label(fid)}",
-                         f"Receive Only folder '{label(fid)}' has local NAS changes.\n"
-                         f"Changed items: {count}\nChanged bytes: {nbytes}\n\n"
-                         "Review Syncthing before using Revert Local Changes.")
+
+        previous = s["receiveOnly"].get(fid)
+        observed_at = datetime.now(timezone.utc).isoformat()
+        new_state, alerts = evaluate_receive_only(
+            previous,
+            observation,
+            observed_at=observed_at,
+        )
+
+        if previous != new_state:
+            s["receiveOnly"][fid] = new_state
             changed = True
-        elif old and not dirty:
+
+        if "initial" in alerts:
+            queue_notice(
+                s,
+                f"[Syncthing] local changes detected — {label(fid)}",
+                f"Receive Only folder '{label(fid)}' has local NAS changes.\n"
+                f"Changed items: {new_state['receiveOnlyTotalItems']}\n"
+                f"Changed bytes: {new_state['receiveOnlyChangedBytes']}\n\n"
+                "Review Syncthing before using Revert Local Changes.",
+            )
+            changed = True
+
+        if "worsened" in alerts:
+            log(
+                f"receive-only divergence worsened: {label(fid)} "
+                f"{previous['lastObservedCount']} -> "
+                f"{new_state['lastObservedCount']}; "
+                "notification deferred pending coalescing policy"
+            )
+
+        if (
+            previous is not None
+            and previous.get("lastObservedCount", 0) > 0
+            and new_state["lastObservedCount"] == 0
+        ):
             log(f"receive-only state cleared: {label(fid)}")
-        if old != dirty:
-            s["receiveOnly"][fid] = dirty
-            changed = True
-    if changed or force_save: atomic_save(s)
+
+    if changed or force_save:
+        atomic_save(s)
 
 def incident(s, fid):
     return s["remoteDeletes"].setdefault(fid, {
@@ -286,13 +377,7 @@ def close_quiet_incidents(s):
     if changed: atomic_save(s)
 
 def process_event(s, ev):
-    d = ev.get("data", {})
-    if ev.get("type") == "LocalChangeDetected":
-        fid = d.get("folder") or d.get("folderID")
-        if fid:
-            log(f"local change event: {label(fid, d)}; checking Receive Only state")
-            check_receive_only(s, only_fid=fid)
-    elif ev.get("type") == "RemoteChangeDetected":
+    if ev.get("type") == "RemoteChangeDetected":
         remote_delete(s, ev)
 
 def process_event_batch(s, events):
