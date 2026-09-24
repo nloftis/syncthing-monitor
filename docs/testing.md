@@ -4,6 +4,37 @@ This document records the principal behaviors verified during development of the
 
 The tests were performed against Syncthing 2.0.10 with Receive Only folders on a Synology NAS.
 
+---
+
+## Automated Regression Tests
+
+The repository includes dependency-free Python `unittest` coverage for
+infrastructure retained during the staged monitor redesign.
+
+Run the suite from the repository root:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+Stage 1 coverage includes:
+
+- startup configuration parsing and validation;
+- state loading and persistence;
+- atomic state-file replacement and failure handling;
+- corrupt or invalid state rejection;
+- notification queue ordering and retry behavior;
+- event-batch ordering, cursor advancement, persistence, and failure handling.
+
+The event-batch tests intentionally preserve the Stage 1 behavior of persisting
+state after each successfully processed event. Later redesign stages may change
+that behavior and must update the corresponding tests deliberately.
+
+The legacy `LocalChangeDetected` Receive Only path is not covered by the new
+Stage 1 regression suite because the Stage 2 design removes that path.
+
+---
+
 ## Receive Only Local Addition
 
 A disposable file was created directly in a NAS-side Receive Only folder.

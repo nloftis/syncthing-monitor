@@ -19,13 +19,13 @@ No operator action is required while all monitored folders remain clean and no s
 On the Synology NAS:
 
 ```bash
-sudo docker ps --filter name=synology-monitor
+sudo docker ps --filter name=syncthing-monitor
 ```
 
 View recent monitor logs with:
 
 ```bash
-sudo docker logs --since 30m synology-monitor
+sudo docker logs --since 30m syncthing-monitor
 ```
 
 Production log timestamps use Hawaii Standard Time through `TZ=Pacific/Honolulu`.
@@ -112,7 +112,7 @@ A monitor-container restart is expected to preserve state.
 After recreation:
 
 ```bash
-sudo docker logs --since 2m synology-monitor
+sudo docker logs --since 2m syncthing-monitor
 ```
 
 A normal restart while Syncthing itself has not restarted should report behavior similar to:
@@ -138,7 +138,7 @@ Changes to `.env` do not alter the environment of an already-running container.
 After changing production environment settings, recreate the monitor container:
 
 ```bash
-sudo docker compose up -d --force-recreate synology-monitor
+sudo docker compose up -d --force-recreate syncthing-monitor
 ```
 
 Then inspect its startup log.

@@ -1,12 +1,12 @@
 services:
-  synology-monitor:
+  syncthing-monitor:
     image: python:3.13-alpine
-    container_name: synology-monitor
+    container_name: syncthing-monitor
     user: "1027:100" # svc-docker / users
     environment:
       TZ: Pacific/Honolulu
     volumes:
-      - ./synology-monitor.py:/app/synology-monitor.py:ro
+      - ./syncthing-monitor.py:/app/syncthing-monitor.py:ro
       - ./state:/state
     # Take the variables in .env and put them into the container's environment.
     env_file:
@@ -15,6 +15,6 @@ services:
     command:
       - python
       - -u
-      - /app/synology-monitor.py
+      - /app/syncthing-monitor.py
     network_mode: host
     restart: unless-stopped

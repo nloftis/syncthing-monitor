@@ -275,7 +275,7 @@ The intended source-controlled project lives on the `corsair` workstation under:
 The production deployment is copied to the Synology NAS under:
 
 ```text
-/volume1/docker/synology_monitor
+/volume1/docker/syncthing-monitor
 ```
 
 The Git repository is the source of truth for application code and configuration templates.
@@ -295,7 +295,7 @@ syncthing-monitor/
 ├── docs/
 │   ├── operations_guide.md
 │   └── testing.md
-└── synology-monitor.py
+└── syncthing-monitor.py
 ```
 
 Historical development snapshots may be retained locally if desired but are not required for deployment.
@@ -308,7 +308,27 @@ Create `.env` from the supplied template:
 cp .env.example .env
 ```
 
-Populate the required Syncthing API and notification credentials.
+The monitor validates required configuration before entering the monitoring loop.
+Startup fails if any of the following are missing or empty:
+
+- `ST_API_KEY`
+- `FOLDERS`
+- `SMTP_USER`
+- `SMTP_PASSWORD`
+- `MAIL_FROM`
+- `MAIL_TO`
+
+`NOTIFY_METHOD` must currently be `email`.
+
+`FOLDERS` must contain comma-separated `id:label` entries. Each entry must
+include both a non-empty Syncthing folder ID and a non-empty label. For example:
+
+```text
+FOLDERS=folder-id-1:documents,folder-id-2:github
+```
+
+Other settings shown in `.env.example` have application defaults unless
+otherwise noted.
 
 Never commit `.env`.
 

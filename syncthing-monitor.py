@@ -7,7 +7,7 @@ from email.message import EmailMessage
 from pathlib import Path
 
 ST_URL = os.getenv("ST_URL", "http://127.0.0.1:8384").rstrip("/")
-ST_API_KEY = os.environ["ST_API_KEY"]
+ST_API_KEY = os.getenv("ST_API_KEY", "")
 STATE_FILE = Path(os.getenv("STATE_FILE", "/state/monitor-state.json"))
 EVENT_TYPES = "LocalChangeDetected,RemoteChangeDetected"
 STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", "900"))
@@ -25,12 +25,55 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 MAIL_FROM = os.getenv("MAIL_FROM", SMTP_USER)
 MAIL_TO = os.getenv("MAIL_TO", "")
 
-FOLDERS = {}
-for item in os.getenv("FOLDERS", "").split(","):
-    item = item.strip()
-    if item:
+def parse_folders(value):
+    folders = {}
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+
         fid, sep, label = item.partition(":")
-        FOLDERS[fid] = label if sep else fid
+        fid = fid.strip()
+        label = label.strip()
+
+        if not sep or not fid or not label:
+            raise ValueError(
+                f"invalid FOLDERS entry {item!r}; expected id:label"
+            )
+
+        folders[fid] = label
+
+    return folders
+
+FOLDERS = parse_folders(os.getenv("FOLDERS", ""))
+
+def validate_config(
+    *,
+    st_api_key,
+    folders,
+    notify_method,
+    smtp_user,
+    smtp_password,
+    mail_from,
+    mail_to,
+):
+    required = {
+        "ST_API_KEY": st_api_key,
+        "FOLDERS": folders,
+        "SMTP_USER": smtp_user,
+        "SMTP_PASSWORD": smtp_password,
+        "MAIL_FROM": mail_from,
+        "MAIL_TO": mail_to,
+    }
+
+    for name, value in required.items():
+        if not value:
+            raise RuntimeError(f"{name} is empty")
+
+    if notify_method != "email":
+        raise RuntimeError(
+            f"unsupported NOTIFY_METHOD: {notify_method!r}"
+        )
 
 def log(msg):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
@@ -252,6 +295,19 @@ def process_event(s, ev):
     elif ev.get("type") == "RemoteChangeDetected":
         remote_delete(s, ev)
 
+def process_event_batch(s, events):
+    for event in events:
+        try:
+            process_event(s, event)
+            s["lastEventId"] = int(event["id"])
+            atomic_save(s)
+        except Exception as e:
+            log(
+                f"event {event.get('id', '?')} failed; "
+                f"cursor not advanced: {e}"
+            )
+            break
+
 def restart(s, new_st):
     log("Syncthing restart detected; resetting cursor for new process")
     s["syncthingStartTime"], s["lastEventId"], s["remoteDeletes"] = new_st, 0, {}
@@ -266,7 +322,15 @@ def wait_syncthing():
             time.sleep(10)
 
 def main():
-    if not FOLDERS: raise RuntimeError("FOLDERS is empty")
+    validate_config(
+        st_api_key=ST_API_KEY,
+        folders=FOLDERS,
+        notify_method=NOTIFY_METHOD,
+        smtp_user=SMTP_USER,
+        smtp_password=SMTP_PASSWORD,
+        mail_from=MAIL_FROM,
+        mail_to=MAIL_TO,
+    )
     current = wait_syncthing()
     s = load_state()
     if s is None:
@@ -315,15 +379,7 @@ def main():
             time.sleep(5)
             continue
 
-        for ev in events:
-            try:
-                process_event(s, ev)
-                # Effects + pending notices are persisted with the cursor.
-                s["lastEventId"] = int(ev["id"])
-                atomic_save(s)
-            except Exception as e:
-                log(f"event {ev.get('id', '?')} failed; cursor not advanced: {e}")
-                break
+        process_event_batch(s, events)
 
 if __name__ == "__main__":
     try: main()
