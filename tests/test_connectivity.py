@@ -211,7 +211,19 @@ class SourceConnectivityCheckerTests(unittest.TestCase):
 
 
 class SourceConnectivityObservationTests(unittest.TestCase):
+    def test_missing_local_device_id_is_rejected(self):
+        with patch.object(
+            monitor,
+            "api",
+            return_value={},
+        ) as api:
+            with self.assertRaisesRegex(RuntimeError, "missing myID"):
+                monitor.observe_source_connectivity()
+
+        api.assert_called_once_with("/rest/system/status")
+
     def test_missing_connection_entry_is_observed_as_disconnected(self):
+        status = {"myID": "LOCAL-DEVICE-ID"}
         stats = json.loads(DEVICE_STATS_FIXTURE.read_text())
         connections = {
             "connections": {},
@@ -220,20 +232,16 @@ class SourceConnectivityObservationTests(unittest.TestCase):
             },
         }
         devices = [
-            {
-                "deviceID": "SOURCE-DEVICE-ID",
-                "name": "Authoritative Source",
-            },
+            {"deviceID": "LOCAL-DEVICE-ID"},
+            {"deviceID": "SOURCE-DEVICE-ID"},
         ]
 
         with patch.object(
             monitor,
             "api",
-            side_effect=[devices, stats, connections],
+            side_effect=[status, devices, stats, connections],
         ):
-            observation = monitor.observe_source_connectivity(
-                "Authoritative Source",
-            )
+            observation = monitor.observe_source_connectivity()
 
         self.assertEqual(
             observation,
@@ -247,29 +255,21 @@ class SourceConnectivityObservationTests(unittest.TestCase):
             },
         )
 
-
     def test_observes_authoritative_source_from_both_endpoints(self):
+        status = {"myID": "LOCAL-DEVICE-ID"}
         stats = json.loads(DEVICE_STATS_FIXTURE.read_text())
         connections = json.loads(CONNECTIONS_FIXTURE.read_text())
         devices = [
-            {
-                "deviceID": "LOCAL-DEVICE-ID",
-                "name": "Backup NAS",
-            },
-            {
-                "deviceID": "SOURCE-DEVICE-ID",
-                "name": "Authoritative Source",
-            },
+            {"deviceID": "LOCAL-DEVICE-ID"},
+            {"deviceID": "SOURCE-DEVICE-ID"},
         ]
 
         with patch.object(
             monitor,
             "api",
-            side_effect=[devices, stats, connections],
+            side_effect=[status, devices, stats, connections],
         ) as api:
-            observation = monitor.observe_source_connectivity(
-                "Authoritative Source",
-            )
+            observation = monitor.observe_source_connectivity()
 
         self.assertEqual(
             observation,
@@ -285,6 +285,7 @@ class SourceConnectivityObservationTests(unittest.TestCase):
         self.assertEqual(
             api.call_args_list,
             [
+                call("/rest/system/status"),
                 call("/rest/config/devices"),
                 call("/rest/stats/device"),
                 call("/rest/system/connections"),

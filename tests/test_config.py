@@ -56,60 +56,54 @@ class ParseFoldersTests(unittest.TestCase):
             monitor.parse_folders("tdtbs-2don4:")
 
 class AuthoritativeDeviceTests(unittest.TestCase):
-    def test_authoritative_device_id_is_derived_by_exact_name(self):
+    def test_authoritative_device_id_is_derived_from_device_topology(self):
         devices = [
-            {
-                "deviceID": "synology-id",
-                "name": "Synology",
-            },
-            {
-                "deviceID": "source-host-id",
-                "name": "source-host",
-            },
+            {"deviceID": "synology-id"},
+            {"deviceID": "source-host-id"},
         ]
 
         self.assertEqual(
-            monitor.authoritative_device_id(devices, "source-host"),
+            monitor.authoritative_device_id(
+                devices,
+                "synology-id",
+            ),
             "source-host-id",
         )
 
-    def test_authoritative_device_name_matching_is_exact(self):
+    def test_missing_remote_device_is_rejected(self):
         devices = [
-            {
-                "deviceID": "wrong-case-id",
-                "name": "Source-Host",
-            },
-            {
-                "deviceID": "source-host-id",
-                "name": "source-host",
-            },
+            {"deviceID": "synology-id"},
         ]
 
-        self.assertEqual(
-            monitor.authoritative_device_id(devices, "source-host"),
-            "source-host-id",
-        )
+        with self.assertRaisesRegex(RuntimeError, "authoritative device"):
+            monitor.authoritative_device_id(
+                devices,
+                "synology-id",
+            )
 
-    def test_missing_authoritative_device_is_rejected(self):
+    def test_multiple_remote_devices_are_rejected_as_ambiguous(self):
         devices = [
-            {
-                "deviceID": "synology-id",
-                "name": "Synology",
-            },
+            {"deviceID": "synology-id"},
+            {"deviceID": "source-a-id"},
+            {"deviceID": "source-b-id"},
         ]
 
-        with self.assertRaisesRegex(RuntimeError, "source-host"):
-            monitor.authoritative_device_id(devices, "source-host")
+        with self.assertRaisesRegex(RuntimeError, "ambiguous"):
+            monitor.authoritative_device_id(
+                devices,
+                "synology-id",
+            )
 
-    def test_authoritative_device_without_device_id_is_rejected(self):
+    def test_missing_local_device_is_rejected(self):
         devices = [
-            {
-                "name": "source-host",
-            },
+            {"deviceID": "source-host-id"},
         ]
 
-        with self.assertRaisesRegex(RuntimeError, "deviceID"):
-            monitor.authoritative_device_id(devices, "source-host")
+        with self.assertRaisesRegex(RuntimeError, "local device"):
+            monitor.authoritative_device_id(
+                devices,
+                "synology-id",
+            )
 
 
 class FolderConfigEvaluatorTests(unittest.TestCase):
@@ -185,32 +179,35 @@ class FolderConfigEvaluatorTests(unittest.TestCase):
 
 
 class ConfigurationObservationTests(unittest.TestCase):
-    def test_clean_configuration_is_observed(self):
-        devices = [
-            {
-                "deviceID": "synology-id",
-                "name": "Synology",
-            },
-            {
-                "deviceID": "source-host-id",
-                "name": "source-host",
-            },
-        ]
+    def test_missing_local_device_id_is_rejected(self):
+        with patch.object(
+            monitor,
+            "api",
+            return_value={},
+        ) as api:
+            with self.assertRaisesRegex(RuntimeError, "missing myID"):
+                monitor.observe_configuration()
 
-        folder_configs = {
-            "documents-id": {
-                "type": "receiveonly",
-                "paused": False,
-                "fsWatcherEnabled": True,
-                "versioning": {
-                    "type": "staggered",
-                    "params": {"maxAge": "31536000"},
-                },
-                "devices": [
-                    {"deviceID": "synology-id"},
-                    {"deviceID": "source-host-id"},
-                ],
+        api.assert_called_once_with("/rest/system/status")
+
+    def test_clean_configuration_is_observed(self):
+        status = {"myID": "synology-id"}
+        devices = [
+            {"deviceID": "synology-id"},
+            {"deviceID": "source-host-id"},
+        ]
+        folder_config = {
+            "type": "receiveonly",
+            "paused": False,
+            "fsWatcherEnabled": True,
+            "versioning": {
+                "type": "staggered",
+                "params": {"maxAge": "31536000"},
             },
+            "devices": [
+                {"deviceID": "synology-id"},
+                {"deviceID": "source-host-id"},
+            ],
         }
 
         with (
@@ -222,10 +219,10 @@ class ConfigurationObservationTests(unittest.TestCase):
             patch.object(
                 monitor,
                 "api",
-                side_effect=[devices, folder_configs["documents-id"]],
+                side_effect=[status, devices, folder_config],
             ),
         ):
-            observation = monitor.observe_configuration("source-host")
+            observation = monitor.observe_configuration()
 
         self.assertEqual(
             observation,
@@ -239,14 +236,12 @@ class ConfigurationObservationTests(unittest.TestCase):
             },
         )
 
-    def test_authoritative_device_missing_is_observed(self):
+    def test_authoritative_device_missing_from_folder_is_violation(self):
+        status = {"myID": "synology-id"}
         devices = [
-            {
-                "deviceID": "synology-id",
-                "name": "Synology",
-            },
+            {"deviceID": "synology-id"},
+            {"deviceID": "source-host-id"},
         ]
-
         folder_config = {
             "type": "receiveonly",
             "paused": False,
@@ -261,19 +256,23 @@ class ConfigurationObservationTests(unittest.TestCase):
         }
 
         with (
-            patch.object(monitor, "FOLDERS", {"documents-id": "documents"}),
+            patch.object(
+                monitor,
+                "FOLDERS",
+                {"documents-id": "documents"},
+            ),
             patch.object(
                 monitor,
                 "api",
-                side_effect=[devices, folder_config],
+                side_effect=[status, devices, folder_config],
             ),
         ):
-            observation = monitor.observe_configuration("source-host")
+            observation = monitor.observe_configuration()
 
         self.assertEqual(
             observation,
             {
-                "authoritativeDeviceId": None,
+                "authoritativeDeviceId": "source-host-id",
                 "folders": {
                     "documents-id": {
                         "violations": ["authoritativeDevice"],
@@ -283,17 +282,11 @@ class ConfigurationObservationTests(unittest.TestCase):
         )
 
     def test_authoritative_device_id_change_is_observed_as_folder_violation(self):
+        status = {"myID": "synology-id"}
         devices = [
-            {
-                "deviceID": "synology-id",
-                "name": "Synology",
-            },
-            {
-                "deviceID": "new-source-host-id",
-                "name": "source-host",
-            },
+            {"deviceID": "synology-id"},
+            {"deviceID": "new-source-host-id"},
         ]
-
         folder_config = {
             "type": "receiveonly",
             "paused": False,
@@ -317,10 +310,10 @@ class ConfigurationObservationTests(unittest.TestCase):
             patch.object(
                 monitor,
                 "api",
-                side_effect=[devices, folder_config],
+                side_effect=[status, devices, folder_config],
             ),
         ):
-            observation = monitor.observe_configuration("source-host")
+            observation = monitor.observe_configuration()
 
         self.assertEqual(
             observation["authoritativeDeviceId"],
@@ -435,11 +428,6 @@ class ConfigurationCheckerTests(unittest.TestCase):
                 "observe_configuration",
                 side_effect=RuntimeError("simulated API failure"),
             ),
-            patch.object(
-                monitor,
-                "AUTHORITATIVE_DEVICE_NAME",
-                "source-host",
-            ),
             patch.object(monitor, "atomic_save") as save,
         ):
             succeeded = monitor.check_configuration(state)
@@ -477,11 +465,6 @@ class ConfigurationCheckerTests(unittest.TestCase):
                 "observe_configuration",
                 return_value=observation,
             ),
-            patch.object(
-                monitor,
-                "AUTHORITATIVE_DEVICE_NAME",
-                "source-host",
-            ),
             patch.object(monitor, "atomic_save") as save,
         ):
             succeeded = monitor.check_configuration(state)
@@ -496,7 +479,6 @@ class ValidateConfigTests(unittest.TestCase):
     def valid_config(self):
         return {
             "st_api_key": "test-api-key",
-            "authoritative_device_name": "source-host",
             "folders": {"folder-id": "documents"},
             "notify_method": "email",
             "smtp_user": "sender@example.com",
@@ -522,15 +504,8 @@ class ValidateConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "FOLDERS"):
             monitor.validate_config(**config)
 
-    def test_missing_authoritative_device_name_is_rejected(self):
-        config = self.valid_config()
-        config["authoritative_device_name"] = ""
-
-        with self.assertRaisesRegex(
-            RuntimeError,
-            "AUTHORITATIVE_DEVICE_NAME",
-        ):
-            monitor.validate_config(**config)
+    def test_source_identity_configuration_is_not_required(self):
+        monitor.validate_config(**self.valid_config())
 
     def test_missing_smtp_user_is_rejected(self):
         config = self.valid_config()

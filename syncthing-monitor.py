@@ -8,7 +8,6 @@ from pathlib import Path
 
 ST_URL = os.getenv("ST_URL", "http://127.0.0.1:8384").rstrip("/")
 ST_API_KEY = os.getenv("ST_API_KEY", "")
-AUTHORITATIVE_DEVICE_NAME = os.getenv("AUTHORITATIVE_DEVICE_NAME", "")
 STATE_FILE = Path(os.getenv("STATE_FILE", "/state/monitor-state.json"))
 EVENT_TYPES = "RemoteChangeDetected"
 STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", "60"))
@@ -51,7 +50,6 @@ FOLDERS = parse_folders(os.getenv("FOLDERS", ""))
 def validate_config(
     *,
     st_api_key,
-    authoritative_device_name,
     folders,
     notify_method,
     smtp_user,
@@ -61,7 +59,6 @@ def validate_config(
 ):
     required = {
         "ST_API_KEY": st_api_key,
-        "AUTHORITATIVE_DEVICE_NAME": authoritative_device_name,
         "FOLDERS": folders,
         "SMTP_USER": smtp_user,
         "SMTP_PASSWORD": smtp_password,
@@ -253,23 +250,45 @@ def event_epoch(value):
 def label(fid, data=None):
     return FOLDERS.get(fid) or (data or {}).get("label") or fid
 
-def authoritative_device_id(devices, device_name):
-    for device in devices:
-        if device.get("name") != device_name:
-            continue
-        device_id = device.get("deviceID")
-        if not device_id:
-            raise RuntimeError(
-                f"{device_name} device is missing deviceID"
-            )
-        return device_id
-    raise RuntimeError(f"{device_name} device not found")
+def authoritative_device_id(devices, local_device_id):
+    device_ids = {
+        device.get("deviceID")
+        for device in devices
+        if isinstance(device, dict) and device.get("deviceID")
+    }
 
-def observe_source_connectivity(authoritative_device_name):
+    if local_device_id not in device_ids:
+        raise RuntimeError(
+            "local device is missing from device topology"
+        )
+
+    remote_device_ids = device_ids - {local_device_id}
+
+    if not remote_device_ids:
+        raise RuntimeError(
+            "authoritative device not found in device topology"
+        )
+
+    if len(remote_device_ids) != 1:
+        raise RuntimeError(
+            "authoritative device topology is ambiguous"
+        )
+
+    return next(iter(remote_device_ids))
+
+def observe_source_connectivity():
+    status = api("/rest/system/status")
+    local_device_id = status.get("myID")
+
+    if not local_device_id:
+        raise RuntimeError(
+            "Syncthing system status is missing myID"
+        )
+
     devices = api("/rest/config/devices")
     authoritative_id = authoritative_device_id(
         devices,
-        authoritative_device_name,
+        local_device_id,
     )
 
     stats = api("/rest/stats/device")
@@ -297,9 +316,7 @@ def observe_source_connectivity(authoritative_device_name):
 
 def check_source_connectivity(s):
     try:
-        observation = observe_source_connectivity(
-            AUTHORITATIVE_DEVICE_NAME,
-        )
+        observation = observe_source_connectivity()
     except Exception as e:
         log(f"source connectivity observation failed: {e}")
         return False
@@ -363,16 +380,20 @@ def evaluate_folder_config(config, authoritative_device_id):
     return violations
 
 
-def observe_configuration(authoritative_device_name):
-    devices = api("/rest/config/devices")
+def observe_configuration():
+    status = api("/rest/system/status")
+    local_device_id = status.get("myID")
 
-    try:
-        authoritative_id = authoritative_device_id(
-            devices,
-            authoritative_device_name,
+    if not local_device_id:
+        raise RuntimeError(
+            "Syncthing system status is missing myID"
         )
-    except RuntimeError:
-        authoritative_id = None
+
+    devices = api("/rest/config/devices")
+    authoritative_id = authoritative_device_id(
+        devices,
+        local_device_id,
+    )
 
     observations = {}
 
@@ -417,9 +438,7 @@ def evaluate_configuration(previous, observation):
 
 def check_configuration(s):
     try:
-        observation = observe_configuration(
-            AUTHORITATIVE_DEVICE_NAME,
-        )
+        observation = observe_configuration()
     except Exception as e:
         log(f"configuration check failed: {e}")
         return False
@@ -790,7 +809,6 @@ def wait_syncthing():
 def main():
     validate_config(
         st_api_key=ST_API_KEY,
-        authoritative_device_name=AUTHORITATIVE_DEVICE_NAME,
         folders=FOLDERS,
         notify_method=NOTIFY_METHOD,
         smtp_user=SMTP_USER,
