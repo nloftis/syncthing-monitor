@@ -181,6 +181,232 @@ class StatePersistenceTests(unittest.TestCase):
         )
         self.assertEqual(normalized["lastEventId"], 350)
 
+    def test_normalize_state_adds_configuration_state(self):
+        state = {
+            "version": 4,
+            "syncthingStartTime": "example",
+            "lastEventId": 123,
+            "receiveOnly": {},
+            "remoteDeletes": {},
+            "pendingNotifications": [],
+        }
+
+        normalized = monitor.normalize_state(state)
+
+        self.assertIsNone(normalized["configuration"])
+
+    def test_normalize_state_adds_source_connectivity_state(self):
+        state = {
+            "version": 4,
+            "syncthingStartTime": "example",
+            "lastEventId": 123,
+            "receiveOnly": {},
+            "remoteDeletes": {},
+            "pendingNotifications": [],
+        }
+
+        normalized = monitor.normalize_state(state)
+
+        self.assertIsNone(normalized["sourceConnectivity"])
+
+
+    def test_normalize_state_adds_folder_health_state(self):
+        state = {
+            "version": 4,
+            "syncthingStartTime": "example",
+            "lastEventId": 123,
+            "receiveOnly": {},
+            "remoteDeletes": {},
+            "pendingNotifications": [],
+        }
+
+        normalized = monitor.normalize_state(state)
+
+        self.assertIsNone(normalized["folderHealth"])
+
+    def test_normalize_state_adds_api_health_state(self):
+        state = {
+            "version": 4,
+            "syncthingStartTime": "example",
+            "lastEventId": 123,
+            "receiveOnly": {},
+            "remoteDeletes": {},
+            "pendingNotifications": [],
+        }
+
+        normalized = monitor.normalize_state(state)
+
+        self.assertEqual(
+            normalized["apiHealth"],
+            {"consecutiveFailures": 0},
+        )
+
+    def test_backup_state_failed_cycle_increments_api_streak_once(self):
+        state = {
+            "apiHealth": {"consecutiveFailures": 2},
+            "pendingNotifications": [],
+        }
+
+        with (
+            patch.object(
+                monitor,
+                "check_receive_only",
+                return_value=False,
+            ) as receive_only,
+            patch.object(
+                monitor,
+                "check_configuration",
+                return_value=True,
+            ) as configuration,
+            patch.object(
+                monitor,
+                "check_folder_health",
+                return_value=False,
+            ) as folder_health,
+            patch.object(
+                monitor,
+                "check_source_connectivity",
+                return_value=True,
+            ) as source_connectivity,
+            patch.object(monitor, "atomic_save") as save,
+        ):
+            monitor.check_backup_state(state)
+
+        receive_only.assert_called_once_with(state, False)
+        configuration.assert_called_once_with(state)
+        folder_health.assert_called_once_with(state)
+        source_connectivity.assert_called_once_with(state)
+        self.assertEqual(
+            state["apiHealth"],
+            {"consecutiveFailures": 3},
+        )
+        self.assertEqual(state["pendingNotifications"], [])
+        save.assert_called_once_with(state)
+
+    def test_backup_state_successful_cycle_resets_api_streak(self):
+        state = {
+            "apiHealth": {"consecutiveFailures": 3},
+            "pendingNotifications": [],
+        }
+
+        with (
+            patch.object(
+                monitor,
+                "check_receive_only",
+                return_value=True,
+            ) as receive_only,
+            patch.object(
+                monitor,
+                "check_configuration",
+                return_value=True,
+            ) as configuration,
+            patch.object(
+                monitor,
+                "check_folder_health",
+                return_value=True,
+            ) as folder_health,
+            patch.object(
+                monitor,
+                "check_source_connectivity",
+                return_value=True,
+            ) as source_connectivity,
+            patch.object(monitor, "atomic_save") as save,
+        ):
+            monitor.check_backup_state(state)
+
+        receive_only.assert_called_once_with(state, False)
+        configuration.assert_called_once_with(state)
+        folder_health.assert_called_once_with(state)
+        source_connectivity.assert_called_once_with(state)
+        self.assertEqual(
+            state["apiHealth"],
+            {"consecutiveFailures": 0},
+        )
+        self.assertEqual(state["pendingNotifications"], [])
+        save.assert_called_once_with(state)
+
+    def test_backup_state_success_at_zero_does_not_save_api_health(self):
+        state = {
+            "apiHealth": {"consecutiveFailures": 0},
+            "pendingNotifications": [],
+        }
+
+        with (
+            patch.object(
+                monitor,
+                "check_receive_only",
+                return_value=True,
+            ) as receive_only,
+            patch.object(
+                monitor,
+                "check_configuration",
+                return_value=True,
+            ) as configuration,
+            patch.object(
+                monitor,
+                "check_folder_health",
+                return_value=True,
+            ) as folder_health,
+            patch.object(
+                monitor,
+                "check_source_connectivity",
+                return_value=True,
+            ) as source_connectivity,
+            patch.object(monitor, "atomic_save") as save,
+        ):
+            monitor.check_backup_state(state)
+
+        receive_only.assert_called_once_with(state, False)
+        configuration.assert_called_once_with(state)
+        folder_health.assert_called_once_with(state)
+        source_connectivity.assert_called_once_with(state)
+        self.assertEqual(
+            state["apiHealth"],
+            {"consecutiveFailures": 0},
+        )
+        self.assertEqual(state["pendingNotifications"], [])
+        save.assert_not_called()
+
+    def test_api_health_first_failed_cycle_sets_streak_to_one(self):
+        previous = {"consecutiveFailures": 0}
+
+        result = monitor.evaluate_api_health(
+            previous,
+            verification_succeeded=False,
+        )
+
+        self.assertEqual(result, {"consecutiveFailures": 1})
+
+    def test_api_health_consecutive_failed_cycle_increments_streak(self):
+        previous = {"consecutiveFailures": 3}
+
+        result = monitor.evaluate_api_health(
+            previous,
+            verification_succeeded=False,
+        )
+
+        self.assertEqual(result, {"consecutiveFailures": 4})
+
+    def test_api_health_successful_cycle_resets_failure_streak(self):
+        previous = {"consecutiveFailures": 3}
+
+        result = monitor.evaluate_api_health(
+            previous,
+            verification_succeeded=True,
+        )
+
+        self.assertEqual(result, {"consecutiveFailures": 0})
+
+    def test_api_health_successful_cycle_keeps_zero_streak(self):
+        previous = {"consecutiveFailures": 0}
+
+        result = monitor.evaluate_api_health(
+            previous,
+            verification_succeeded=True,
+        )
+
+        self.assertEqual(result, {"consecutiveFailures": 0})
+
     def test_fresh_state_has_no_receive_only_observation(self):
         folder_id = "test-folder"
 
@@ -188,6 +414,13 @@ class StatePersistenceTests(unittest.TestCase):
             state = monitor.fresh_state("example", 123)
 
         self.assertIsNone(state["receiveOnly"][folder_id])
+        self.assertIsNone(state["configuration"])
+        self.assertIsNone(state["folderHealth"])
+        self.assertIsNone(state["sourceConnectivity"])
+        self.assertEqual(
+            state["apiHealth"],
+            {"consecutiveFailures": 0},
+        )
 
 
 if __name__ == "__main__":

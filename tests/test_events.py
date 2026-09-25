@@ -437,6 +437,13 @@ class RestartTests(unittest.TestCase):
             import copy
             saved_states.append(copy.deepcopy(current_state))
 
+        verification_saves_seen = []
+
+        def capture_verification(current_state, force_save=False):
+            verification_saves_seen.append(
+                (len(saved_states), force_save)
+            )
+
         with (
             patch.object(
                 monitor,
@@ -448,12 +455,24 @@ class RestartTests(unittest.TestCase):
                 "atomic_save",
                 side_effect=capture_save,
             ) as save,
-            patch.object(monitor, "check_receive_only"),
+            patch.object(
+                monitor,
+                "check_backup_state",
+                side_effect=capture_verification,
+            ) as check_backup_state,
         ):
             monitor.restart(state, "new-start")
 
         self.assertEqual(save.call_count, 1)
         self.assertEqual(len(saved_states), 1)
+        check_backup_state.assert_called_once_with(
+            state,
+            force_save=True,
+        )
+        self.assertEqual(
+            verification_saves_seen,
+            [(1, True)],
+        )
 
         saved = saved_states[0]
         self.assertEqual(len(saved["pendingNotifications"]), 1)

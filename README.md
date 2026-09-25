@@ -19,7 +19,7 @@ This complements Receive Only replication and file versioning without turning an
 
 ## Protection Model
 
-In this environment, source systems such as the `corsair` workstation are authoritative.
+In this environment, designated source systems are authoritative.
 
 The Synology NAS receives those files through Syncthing folders configured as:
 
@@ -317,7 +317,7 @@ Machine-oriented timestamps that are explicitly stored as UTC remain UTC.
 
 ## Deployment
 
-The intended source-controlled project lives on the `corsair` workstation under:
+The intended source-controlled project lives on the authoritative source workstation under:
 
 ```text
 ~/GitHub/syncthing-monitor
@@ -346,6 +346,19 @@ syncthing-monitor/
 ├── docs/
 │   ├── operations_guide.md
 │   └── testing.md
+├── tests/
+│   ├── fixtures/
+│   │   ├── db-status-clean-syncthing-2.0.10.json
+│   │   ├── device-stats-connected-syncthing-2.0.10.json
+│   │   ├── folder-errors-clean-syncthing-2.0.10.json
+│   │   └── system-connections-connected-syncthing-2.0.10.json
+│   ├── test_config.py
+│   ├── test_connectivity.py
+│   ├── test_events.py
+│   ├── test_health.py
+│   ├── test_notifications.py
+│   ├── test_receive_only.py
+│   └── test_state.py
 └── syncthing-monitor.py
 ```
 

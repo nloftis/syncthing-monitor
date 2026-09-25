@@ -4,5 +4,8 @@
   "receiveOnlyChangedSymlinks": 0,
   "receiveOnlyChangedDeletes": 0,
   "receiveOnlyChangedBytes": 0,
-  "receiveOnlyTotalItems": 0
+  "receiveOnlyTotalItems": 0,
+  "state": "idle",
+  "error": "",
+  "watchError": ""
 }

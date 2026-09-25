@@ -8,6 +8,7 @@ from pathlib import Path
 
 ST_URL = os.getenv("ST_URL", "http://127.0.0.1:8384").rstrip("/")
 ST_API_KEY = os.getenv("ST_API_KEY", "")
+AUTHORITATIVE_DEVICE_NAME = os.getenv("AUTHORITATIVE_DEVICE_NAME", "")
 STATE_FILE = Path(os.getenv("STATE_FILE", "/state/monitor-state.json"))
 EVENT_TYPES = "RemoteChangeDetected"
 STATUS_INTERVAL = int(os.getenv("STATUS_INTERVAL", "60"))
@@ -50,6 +51,7 @@ FOLDERS = parse_folders(os.getenv("FOLDERS", ""))
 def validate_config(
     *,
     st_api_key,
+    authoritative_device_name,
     folders,
     notify_method,
     smtp_user,
@@ -59,6 +61,7 @@ def validate_config(
 ):
     required = {
         "ST_API_KEY": st_api_key,
+        "AUTHORITATIVE_DEVICE_NAME": authoritative_device_name,
         "FOLDERS": folders,
         "SMTP_USER": smtp_user,
         "SMTP_PASSWORD": smtp_password,
@@ -134,7 +137,12 @@ def fresh_state(st, last_id):
     return {
         "version": 4, "syncthingStartTime": st, "lastEventId": last_id,
         "receiveOnly": {fid: None for fid in FOLDERS},
-        "remoteDeletes": {}, "pendingNotifications": []
+        "remoteDeletes": {},
+        "configuration": None,
+        "folderHealth": None,
+        "sourceConnectivity": None,
+        "apiHealth": {"consecutiveFailures": 0},
+        "pendingNotifications": []
     }
 
 def normalize_state(s):
@@ -154,8 +162,48 @@ def normalize_state(s):
             s["receiveOnly"][fid] = None
 
     s.setdefault("remoteDeletes", {})
+    s.setdefault("configuration", None)
+    s.setdefault("folderHealth", None)
+    s.setdefault("sourceConnectivity", None)
+    s.setdefault("apiHealth", {"consecutiveFailures": 0})
     s.setdefault("pendingNotifications", [])
     return s
+
+def evaluate_api_health(previous, verification_succeeded):
+    consecutive_failures = int(previous.get("consecutiveFailures", 0))
+
+    if verification_succeeded:
+        consecutive_failures = 0
+    else:
+        consecutive_failures += 1
+
+    return {
+        "consecutiveFailures": consecutive_failures,
+    }
+
+def check_backup_state(s, force_save=False):
+    results = [
+        check_receive_only(s, force_save),
+        check_configuration(s),
+        check_folder_health(s),
+        check_source_connectivity(s),
+    ]
+
+    verification_succeeded = all(
+        result is True
+        for result in results
+    )
+
+    previous = s["apiHealth"]
+    new_state = evaluate_api_health(
+        previous,
+        verification_succeeded,
+    )
+
+    if new_state != previous:
+        s["apiHealth"] = new_state
+        atomic_save(s)
+
 
 def queue_notice(s, subject, body):
     s["pendingNotifications"].append({
@@ -204,6 +252,316 @@ def event_epoch(value):
 
 def label(fid, data=None):
     return FOLDERS.get(fid) or (data or {}).get("label") or fid
+
+def authoritative_device_id(devices, device_name):
+    for device in devices:
+        if device.get("name") != device_name:
+            continue
+        device_id = device.get("deviceID")
+        if not device_id:
+            raise RuntimeError(
+                f"{device_name} device is missing deviceID"
+            )
+        return device_id
+    raise RuntimeError(f"{device_name} device not found")
+
+def observe_source_connectivity(authoritative_device_name):
+    devices = api("/rest/config/devices")
+    authoritative_id = authoritative_device_id(
+        devices,
+        authoritative_device_name,
+    )
+
+    stats = api("/rest/stats/device")
+    connections = api("/rest/system/connections")
+
+    device_stats = stats.get(authoritative_id, {})
+    connection = (
+        connections.get("connections", {}).get(
+            authoritative_id,
+            {},
+        )
+    )
+
+    return {
+        "deviceId": authoritative_id,
+        "lastSeen": device_stats.get("lastSeen"),
+        "lastConnectionDurationS": device_stats.get(
+            "lastConnectionDurationS"
+        ),
+        "connected": connection.get("connected", False),
+        "connectionStartedAt": connection.get("startedAt"),
+        "connectionObservedAt": connection.get("at"),
+    }
+
+
+def check_source_connectivity(s):
+    try:
+        observation = observe_source_connectivity(
+            AUTHORITATIVE_DEVICE_NAME,
+        )
+    except Exception as e:
+        log(f"source connectivity observation failed: {e}")
+        return False
+
+    health_state = {
+        "deviceId": observation["deviceId"],
+        "connected": observation["connected"],
+    }
+    previous = s.get("sourceConnectivity")
+
+    if previous == health_state:
+        return True
+
+    s["sourceConnectivity"] = health_state
+    atomic_save(s)
+
+    log(
+        "source connectivity observed: "
+        f"connected={observation['connected']} "
+        f"lastSeen={observation['lastSeen']} "
+        f"lastConnectionDurationS="
+        f"{observation['lastConnectionDurationS']} "
+        f"connectionStartedAt="
+        f"{observation['connectionStartedAt']} "
+        f"connectionObservedAt="
+        f"{observation['connectionObservedAt']}"
+    )
+
+    return True
+
+
+def evaluate_folder_config(config, authoritative_device_id):
+    violations = []
+
+    if config.get("type") != "receiveonly":
+        violations.append("type")
+
+    if config.get("paused") is not False:
+        violations.append("paused")
+
+    if config.get("fsWatcherEnabled") is not True:
+        violations.append("fsWatcherEnabled")
+
+    versioning = config.get("versioning") or {}
+    params = versioning.get("params") or {}
+    if (
+        versioning.get("type") != "staggered"
+        or params.get("maxAge") != "31536000"
+    ):
+        violations.append("versioning")
+
+    devices = config.get("devices") or []
+    device_ids = {
+        device.get("deviceID")
+        for device in devices
+        if isinstance(device, dict)
+    }
+    if authoritative_device_id not in device_ids:
+        violations.append("authoritativeDevice")
+
+    return violations
+
+
+def observe_configuration(authoritative_device_name):
+    devices = api("/rest/config/devices")
+
+    try:
+        authoritative_id = authoritative_device_id(
+            devices,
+            authoritative_device_name,
+        )
+    except RuntimeError:
+        authoritative_id = None
+
+    observations = {}
+
+    for fid in FOLDERS:
+        config = api(
+            f"/rest/config/folders/{urllib.parse.quote(fid, safe='')}"
+        )
+        observations[fid] = {
+            "violations": evaluate_folder_config(
+                config,
+                authoritative_id,
+            ),
+        }
+
+    return {
+        "authoritativeDeviceId": authoritative_id,
+        "folders": observations,
+    }
+
+
+def evaluate_configuration(previous, observation):
+    has_violations = any(
+        folder.get("violations")
+        for folder in observation.get("folders", {}).values()
+    )
+
+    previous_has_violations = (
+        previous is not None
+        and any(
+            folder.get("violations")
+            for folder in previous.get("folders", {}).values()
+        )
+    )
+
+    alerts = []
+
+    if has_violations and not previous_has_violations:
+        alerts.append("initial")
+
+    return observation, alerts
+
+
+def check_configuration(s):
+    try:
+        observation = observe_configuration(
+            AUTHORITATIVE_DEVICE_NAME,
+        )
+    except Exception as e:
+        log(f"configuration check failed: {e}")
+        return False
+
+    previous = s.get("configuration")
+    new_state, alerts = evaluate_configuration(
+        previous,
+        observation,
+    )
+
+    changed = previous != new_state
+
+    if changed:
+        s["configuration"] = new_state
+
+    if "initial" in alerts:
+        violations = []
+
+        for fid, folder in new_state.get("folders", {}).items():
+            for violation in folder.get("violations", []):
+                violations.append(
+                    f"- {label(fid)}: {violation}"
+                )
+
+        queue_notice(
+            s,
+            "[Syncthing] configuration integrity violation",
+            "Syncthing backup configuration no longer matches "
+            "the required protection settings.\n\n"
+            + "\n".join(violations)
+            + "\n\nReview Syncthing configuration before making changes.",
+        )
+        changed = True
+
+    if changed:
+        atomic_save(s)
+
+    return True
+
+
+def observe_folder_health():
+    observations = {}
+
+    for fid in FOLDERS:
+        status = api(
+            "/rest/db/status",
+            {"folder": fid},
+            timeout=15,
+        )
+        folder_errors = api(
+            "/rest/folder/errors",
+            {"folder": fid},
+            timeout=15,
+        )
+        observations[fid] = {
+            "violations": evaluate_folder_health(
+                status,
+                folder_errors,
+            ),
+        }
+
+    return observations
+
+
+def check_folder_health(s):
+    try:
+        observation = observe_folder_health()
+    except Exception as e:
+        log(f"folder health check failed: {e}")
+        return False
+
+    previous = s.get("folderHealth")
+    new_state, alerts = evaluate_health(
+        previous,
+        observation,
+    )
+
+    changed = previous != new_state
+
+    if changed:
+        s["folderHealth"] = new_state
+
+    if "initial" in alerts:
+        violations = []
+
+        for fid, folder in new_state.items():
+            for violation in folder.get("violations", []):
+                violations.append(
+                    f"- {label(fid)}: {violation}"
+                )
+
+        queue_notice(
+            s,
+            "[Syncthing] folder health violation",
+            "Syncthing reported a backup folder health problem.\n\n"
+            + "\n".join(violations)
+            + "\n\nReview Syncthing folder health before making changes.",
+        )
+        changed = True
+
+    if changed:
+        atomic_save(s)
+
+    return True
+
+
+def evaluate_health(previous, observation):
+    has_violations = any(
+        folder.get("violations")
+        for folder in observation.values()
+    )
+
+    previous_has_violations = (
+        previous is not None
+        and any(
+            folder.get("violations")
+            for folder in previous.values()
+        )
+    )
+
+    alerts = []
+
+    if has_violations and not previous_has_violations:
+        alerts.append("initial")
+
+    return observation, alerts
+
+
+def evaluate_folder_health(status, folder_errors):
+    violations = []
+
+    if status.get("state") == "error":
+        violations.append("state")
+
+    if status.get("watchError"):
+        violations.append("watchError")
+
+    if folder_errors.get("errors"):
+        violations.append("folderErrors")
+
+    return violations
+
 
 RECEIVE_ONLY_COUNTERS = (
     "receiveOnlyChangedFiles",
@@ -267,12 +625,14 @@ def evaluate_receive_only(previous, observation, *, observed_at):
 
 def check_receive_only(s, force_save=False):
     changed = False
+    verification_succeeded = True
 
     for fid in FOLDERS:
         try:
             observation = ro_status(fid)
         except Exception as e:
             log(f"status check failed for {label(fid)}: {e}")
+            verification_succeeded = False
             continue
 
         previous = s["receiveOnly"].get(fid)
@@ -315,6 +675,8 @@ def check_receive_only(s, force_save=False):
 
     if changed or force_save:
         atomic_save(s)
+
+    return verification_succeeded
 
 def incident(s, fid):
     return s["remoteDeletes"].setdefault(fid, {
@@ -416,7 +778,7 @@ def restart(s, new_st):
             queue_incident_close(s, fid, inc, "restart")
     s["syncthingStartTime"], s["lastEventId"], s["remoteDeletes"] = new_st, 0, {}
     atomic_save(s)
-    check_receive_only(s, True)
+    check_backup_state(s, force_save=True)
 
 def wait_syncthing():
     while True:
@@ -428,6 +790,7 @@ def wait_syncthing():
 def main():
     validate_config(
         st_api_key=ST_API_KEY,
+        authoritative_device_name=AUTHORITATIVE_DEVICE_NAME,
         folders=FOLDERS,
         notify_method=NOTIFY_METHOD,
         smtp_user=SMTP_USER,
@@ -442,7 +805,7 @@ def main():
         s = fresh_state(current, baseline)
         atomic_save(s)
         log(f"initialized new state at combined event id {baseline}")
-        check_receive_only(s, True)
+        check_backup_state(s, force_save=True)
     else:
         s = normalize_state(s)
         atomic_save(s)
@@ -462,7 +825,7 @@ def main():
             except Exception as e: log(f"restart check failed: {e}")
 
         if now - last_status >= STATUS_INTERVAL:
-            check_receive_only(s)
+            check_backup_state(s)
             last_status = now
 
         close_quiet_incidents(s)

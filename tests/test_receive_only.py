@@ -238,6 +238,80 @@ class ReceiveOnlyEvaluatorTests(unittest.TestCase):
         self.assertIsNone(new_state["lastAlertTime"])
         self.assertEqual(alerts, [])
 
+    def test_successful_status_check_returns_true(self):
+        folder_id = "test-folder"
+        state = {
+            "receiveOnly": {
+                folder_id: None,
+            },
+            "pendingNotifications": [],
+        }
+
+        with patch.object(
+            monitor,
+            "FOLDERS",
+            {folder_id: "Test Folder"},
+        ):
+            with patch.object(
+                monitor,
+                "ro_status",
+                return_value=observation(0),
+            ):
+                with patch.object(monitor, "atomic_save"):
+                    succeeded = monitor.check_receive_only(state)
+
+        self.assertIs(succeeded, True)
+
+    def test_partial_status_failure_updates_successful_folder_and_returns_false(self):
+        successful_id = "successful-folder"
+        failed_id = "failed-folder"
+
+        failed_previous = {
+            "lastObservedCount": 4,
+            "lastAlertedCount": 4,
+            "lastAlertTime": "2026-09-24T20:00:00+00:00",
+        }
+
+        state = {
+            "receiveOnly": {
+                successful_id: None,
+                failed_id: failed_previous.copy(),
+            },
+            "pendingNotifications": [],
+        }
+
+        def status_for_folder(folder_id):
+            if folder_id == successful_id:
+                return observation(0)
+            raise RuntimeError("simulated API failure")
+
+        with patch.object(
+            monitor,
+            "FOLDERS",
+            {
+                successful_id: "Successful Folder",
+                failed_id: "Failed Folder",
+            },
+        ):
+            with patch.object(
+                monitor,
+                "ro_status",
+                side_effect=status_for_folder,
+            ):
+                with patch.object(monitor, "atomic_save") as save:
+                    succeeded = monitor.check_receive_only(state)
+
+        self.assertIs(succeeded, False)
+        self.assertEqual(
+            state["receiveOnly"][successful_id]["lastObservedCount"],
+            0,
+        )
+        self.assertEqual(
+            state["receiveOnly"][failed_id],
+            failed_previous,
+        )
+        save.assert_called_once_with(state)
+
     def test_status_api_failure_preserves_last_known_state(self):
         folder_id = "test-folder"
         previous = {
@@ -269,8 +343,9 @@ class ReceiveOnlyEvaluatorTests(unittest.TestCase):
                 side_effect=RuntimeError("simulated API failure"),
             ):
                 with patch.object(monitor, "atomic_save") as save:
-                    monitor.check_receive_only(state)
+                    succeeded = monitor.check_receive_only(state)
 
+        self.assertIs(succeeded, False)
         self.assertEqual(state["receiveOnly"][folder_id], previous)
         self.assertEqual(state["pendingNotifications"], [])
         save.assert_not_called()

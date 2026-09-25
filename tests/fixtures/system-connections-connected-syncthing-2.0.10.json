@@ -1,0 +1,13 @@
+{
+  "connections": {
+    "SOURCE-DEVICE-ID": {
+      "at": "2026-09-24T16:19:03-10:00",
+      "startedAt": "2026-09-24T16:15:55-10:00",
+      "connected": true,
+      "paused": false
+    }
+  },
+  "total": {
+    "at": "2026-09-24T16:19:03-10:00"
+  }
+}

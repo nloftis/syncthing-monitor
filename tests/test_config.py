@@ -1,6 +1,7 @@
 import importlib.util
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "syncthing-monitor.py"
@@ -54,10 +55,448 @@ class ParseFoldersTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             monitor.parse_folders("tdtbs-2don4:")
 
+class AuthoritativeDeviceTests(unittest.TestCase):
+    def test_authoritative_device_id_is_derived_by_exact_name(self):
+        devices = [
+            {
+                "deviceID": "synology-id",
+                "name": "Synology",
+            },
+            {
+                "deviceID": "source-host-id",
+                "name": "source-host",
+            },
+        ]
+
+        self.assertEqual(
+            monitor.authoritative_device_id(devices, "source-host"),
+            "source-host-id",
+        )
+
+    def test_authoritative_device_name_matching_is_exact(self):
+        devices = [
+            {
+                "deviceID": "wrong-case-id",
+                "name": "Source-Host",
+            },
+            {
+                "deviceID": "source-host-id",
+                "name": "source-host",
+            },
+        ]
+
+        self.assertEqual(
+            monitor.authoritative_device_id(devices, "source-host"),
+            "source-host-id",
+        )
+
+    def test_missing_authoritative_device_is_rejected(self):
+        devices = [
+            {
+                "deviceID": "synology-id",
+                "name": "Synology",
+            },
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "source-host"):
+            monitor.authoritative_device_id(devices, "source-host")
+
+    def test_authoritative_device_without_device_id_is_rejected(self):
+        devices = [
+            {
+                "name": "source-host",
+            },
+        ]
+
+        with self.assertRaisesRegex(RuntimeError, "deviceID"):
+            monitor.authoritative_device_id(devices, "source-host")
+
+
+class FolderConfigEvaluatorTests(unittest.TestCase):
+    def valid_config(self):
+        return {
+            "type": "receiveonly",
+            "paused": False,
+            "fsWatcherEnabled": True,
+            "versioning": {
+                "type": "staggered",
+                "params": {
+                    "maxAge": "31536000",
+                },
+            },
+            "devices": [
+                {"deviceID": "synology-id"},
+                {"deviceID": "source-host-id"},
+            ],
+        }
+
+    def test_valid_configuration_has_no_violations(self):
+        violations = monitor.evaluate_folder_config(
+            self.valid_config(),
+            "source-host-id",
+        )
+
+        self.assertEqual(violations, [])
+
+    def test_wrong_folder_type_is_reported(self):
+        config = self.valid_config()
+        config["type"] = "sendreceive"
+
+        violations = monitor.evaluate_folder_config(config, "source-host-id")
+
+        self.assertIn("type", violations)
+
+    def test_paused_folder_is_reported(self):
+        config = self.valid_config()
+        config["paused"] = True
+
+        violations = monitor.evaluate_folder_config(config, "source-host-id")
+
+        self.assertIn("paused", violations)
+
+    def test_disabled_filesystem_watcher_is_reported(self):
+        config = self.valid_config()
+        config["fsWatcherEnabled"] = False
+
+        violations = monitor.evaluate_folder_config(config, "source-host-id")
+
+        self.assertIn("fsWatcherEnabled", violations)
+
+    def test_wrong_versioning_configuration_is_reported(self):
+        config = self.valid_config()
+        config["versioning"] = {
+            "type": "simple",
+            "params": {
+                "maxAge": "86400",
+            },
+        }
+
+        violations = monitor.evaluate_folder_config(config, "source-host-id")
+
+        self.assertIn("versioning", violations)
+
+    def test_missing_authoritative_device_is_reported(self):
+        config = self.valid_config()
+        config["devices"] = [{"deviceID": "synology-id"}]
+
+        violations = monitor.evaluate_folder_config(config, "source-host-id")
+
+        self.assertIn("authoritativeDevice", violations)
+
+
+class ConfigurationObservationTests(unittest.TestCase):
+    def test_clean_configuration_is_observed(self):
+        devices = [
+            {
+                "deviceID": "synology-id",
+                "name": "Synology",
+            },
+            {
+                "deviceID": "source-host-id",
+                "name": "source-host",
+            },
+        ]
+
+        folder_configs = {
+            "documents-id": {
+                "type": "receiveonly",
+                "paused": False,
+                "fsWatcherEnabled": True,
+                "versioning": {
+                    "type": "staggered",
+                    "params": {"maxAge": "31536000"},
+                },
+                "devices": [
+                    {"deviceID": "synology-id"},
+                    {"deviceID": "source-host-id"},
+                ],
+            },
+        }
+
+        with (
+            patch.object(
+                monitor,
+                "FOLDERS",
+                {"documents-id": "documents"},
+            ),
+            patch.object(
+                monitor,
+                "api",
+                side_effect=[devices, folder_configs["documents-id"]],
+            ),
+        ):
+            observation = monitor.observe_configuration("source-host")
+
+        self.assertEqual(
+            observation,
+            {
+                "authoritativeDeviceId": "source-host-id",
+                "folders": {
+                    "documents-id": {
+                        "violations": [],
+                    },
+                },
+            },
+        )
+
+    def test_authoritative_device_missing_is_observed(self):
+        devices = [
+            {
+                "deviceID": "synology-id",
+                "name": "Synology",
+            },
+        ]
+
+        folder_config = {
+            "type": "receiveonly",
+            "paused": False,
+            "fsWatcherEnabled": True,
+            "versioning": {
+                "type": "staggered",
+                "params": {"maxAge": "31536000"},
+            },
+            "devices": [
+                {"deviceID": "synology-id"},
+            ],
+        }
+
+        with (
+            patch.object(monitor, "FOLDERS", {"documents-id": "documents"}),
+            patch.object(
+                monitor,
+                "api",
+                side_effect=[devices, folder_config],
+            ),
+        ):
+            observation = monitor.observe_configuration("source-host")
+
+        self.assertEqual(
+            observation,
+            {
+                "authoritativeDeviceId": None,
+                "folders": {
+                    "documents-id": {
+                        "violations": ["authoritativeDevice"],
+                    },
+                },
+            },
+        )
+
+    def test_authoritative_device_id_change_is_observed_as_folder_violation(self):
+        devices = [
+            {
+                "deviceID": "synology-id",
+                "name": "Synology",
+            },
+            {
+                "deviceID": "new-source-host-id",
+                "name": "source-host",
+            },
+        ]
+
+        folder_config = {
+            "type": "receiveonly",
+            "paused": False,
+            "fsWatcherEnabled": True,
+            "versioning": {
+                "type": "staggered",
+                "params": {"maxAge": "31536000"},
+            },
+            "devices": [
+                {"deviceID": "synology-id"},
+                {"deviceID": "old-source-host-id"},
+            ],
+        }
+
+        with (
+            patch.object(
+                monitor,
+                "FOLDERS",
+                {"documents-id": "documents"},
+            ),
+            patch.object(
+                monitor,
+                "api",
+                side_effect=[devices, folder_config],
+            ),
+        ):
+            observation = monitor.observe_configuration("source-host")
+
+        self.assertEqual(
+            observation["authoritativeDeviceId"],
+            "new-source-host-id",
+        )
+        self.assertEqual(
+            observation["folders"]["documents-id"]["violations"],
+            ["authoritativeDevice"],
+        )
+
+
+class ConfigurationEvaluatorTests(unittest.TestCase):
+    def test_initial_clean_observation_establishes_clean_state(self):
+        observation = {
+            "authoritativeDeviceId": "source-host-id",
+            "folders": {
+                "documents-id": {
+                    "violations": [],
+                },
+            },
+        }
+
+        state, alerts = monitor.evaluate_configuration(
+            None,
+            observation,
+        )
+
+        self.assertEqual(state, observation)
+        self.assertEqual(alerts, [])
+
+    def test_clean_to_violation_requests_alert(self):
+        previous = {
+            "authoritativeDeviceId": "source-host-id",
+            "folders": {
+                "documents-id": {
+                    "violations": [],
+                },
+            },
+        }
+        observation = {
+            "authoritativeDeviceId": "source-host-id",
+            "folders": {
+                "documents-id": {
+                    "violations": ["fsWatcherEnabled"],
+                },
+            },
+        }
+
+        state, alerts = monitor.evaluate_configuration(
+            previous,
+            observation,
+        )
+
+        self.assertEqual(state, observation)
+        self.assertEqual(alerts, ["initial"])
+
+    def test_unchanged_violation_does_not_repeat_alert(self):
+        observation = {
+            "authoritativeDeviceId": "source-host-id",
+            "folders": {
+                "documents-id": {
+                    "violations": ["fsWatcherEnabled"],
+                },
+            },
+        }
+
+        state, alerts = monitor.evaluate_configuration(
+            observation,
+            observation,
+        )
+
+        self.assertEqual(state, observation)
+        self.assertEqual(alerts, [])
+
+    def test_initial_violation_requests_alert(self):
+        observation = {
+            "authoritativeDeviceId": "source-host-id",
+            "folders": {
+                "documents-id": {
+                    "violations": ["fsWatcherEnabled"],
+                },
+            },
+        }
+
+        state, alerts = monitor.evaluate_configuration(
+            None,
+            observation,
+        )
+
+        self.assertEqual(state, observation)
+        self.assertEqual(alerts, ["initial"])
+
+
+class ConfigurationCheckerTests(unittest.TestCase):
+    def test_observation_failure_preserves_last_known_state(self):
+        previous = {
+            "authoritativeDeviceId": "source-host-id",
+            "folders": {
+                "documents-id": {
+                    "violations": [],
+                },
+            },
+        }
+        state = {
+            "configuration": previous,
+            "pendingNotifications": [],
+        }
+
+        with (
+            patch.object(
+                monitor,
+                "observe_configuration",
+                side_effect=RuntimeError("simulated API failure"),
+            ),
+            patch.object(
+                monitor,
+                "AUTHORITATIVE_DEVICE_NAME",
+                "source-host",
+            ),
+            patch.object(monitor, "atomic_save") as save,
+        ):
+            succeeded = monitor.check_configuration(state)
+
+        self.assertIs(succeeded, False)
+        self.assertEqual(state["configuration"], previous)
+        self.assertEqual(state["pendingNotifications"], [])
+        save.assert_not_called()
+
+    def test_clean_to_violation_queues_notice_and_saves_state(self):
+        previous = {
+            "authoritativeDeviceId": "source-host-id",
+            "folders": {
+                "documents-id": {
+                    "violations": [],
+                },
+            },
+        }
+        observation = {
+            "authoritativeDeviceId": "source-host-id",
+            "folders": {
+                "documents-id": {
+                    "violations": ["fsWatcherEnabled"],
+                },
+            },
+        }
+        state = {
+            "configuration": previous,
+            "pendingNotifications": [],
+        }
+
+        with (
+            patch.object(
+                monitor,
+                "observe_configuration",
+                return_value=observation,
+            ),
+            patch.object(
+                monitor,
+                "AUTHORITATIVE_DEVICE_NAME",
+                "source-host",
+            ),
+            patch.object(monitor, "atomic_save") as save,
+        ):
+            succeeded = monitor.check_configuration(state)
+
+        self.assertIs(succeeded, True)
+        self.assertEqual(state["configuration"], observation)
+        self.assertEqual(len(state["pendingNotifications"]), 1)
+        save.assert_called_once_with(state)
+
+
 class ValidateConfigTests(unittest.TestCase):
     def valid_config(self):
         return {
             "st_api_key": "test-api-key",
+            "authoritative_device_name": "source-host",
             "folders": {"folder-id": "documents"},
             "notify_method": "email",
             "smtp_user": "sender@example.com",
@@ -81,6 +520,16 @@ class ValidateConfigTests(unittest.TestCase):
         config["folders"] = {}
 
         with self.assertRaisesRegex(RuntimeError, "FOLDERS"):
+            monitor.validate_config(**config)
+
+    def test_missing_authoritative_device_name_is_rejected(self):
+        config = self.valid_config()
+        config["authoritative_device_name"] = ""
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "AUTHORITATIVE_DEVICE_NAME",
+        ):
             monitor.validate_config(**config)
 
     def test_missing_smtp_user_is_rejected(self):
