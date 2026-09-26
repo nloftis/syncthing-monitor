@@ -66,115 +66,96 @@ Syncthing 2.0.10 deployment for the clean response shape. Divergent
 observations used by the evaluator tests are derived synthetically from that
 fixture rather than represented as live-captured production responses.
 
-Stage 2 removes `LocalChangeDetected` from the monitor's Receive Only
-detection path. The historical acceptance tests below are retained because
-they document the Syncthing 2.0.10 behavior that motivated that design
-change; descriptions of v4 event-assisted behavior should not be read as
-descriptions of the current Stage 2 implementation.
+The current implementation does not use `LocalChangeDetected` for Receive Only
+detection. The production evidence below is retained only where it supports the
+current `/rest/db/status` polling design.
 
 ---
 
-## Receive Only Local Addition
+## Receive Only Production Evidence
 
-A disposable file was created directly in a NAS-side Receive Only folder.
+Controlled production testing established the behavior that supports the current
+Receive Only design.
 
-Observed:
+A disposable file created directly in a NAS-side Receive Only folder caused
+Syncthing to report non-zero Receive Only state through `/rest/db/status`. No
+prompt `LocalChangeDetected` event was observed during repeated direct
+event-stream checks. The persistent divergence was detected from Syncthing's
+database state and one notification was sent.
 
-- Syncthing recognized the folder as locally divergent.
-- `/rest/db/status` reported a non-zero Receive Only change count.
-- No prompt `LocalChangeDetected` event was observed during repeated direct event-stream checks.
-- The scheduled database-status fallback detected the persistent dirty state.
-- One notification was sent.
+A synchronized test file was also modified directly on the NAS after a clean
+baseline had been established. Syncthing promptly reported Receive Only
+divergence through `/rest/db/status`, again without a prompt
+`LocalChangeDetected` event.
 
-**Result: PASS — persistent Receive Only divergence is detected independently of `LocalChangeDetected`.**
+These observations established that Receive Only divergence must not depend on
+`LocalChangeDetected`. The current implementation therefore uses periodic
+`/rest/db/status` polling as the sole Receive Only detection mechanism.
 
-## Receive Only Recovery After Local Addition
+**Result: PASS — persistent NAS-local additions and modifications were observable
+through authoritative Receive Only database state independently of
+`LocalChangeDetected`.**
 
-The local addition was recovered using Syncthing's **Revert Local Changes** operation.
+### Receive Only Recovery Evidence
 
-Observed:
+The controlled local-addition and local-modification tests were recovered using
+Syncthing's **Revert Local Changes** operation.
 
-- the NAS-local file was removed;
-- Syncthing emitted `LocalChangeDetected` for the deletion;
-- the monitor consumed the event;
-- v4 immediately checked Receive Only state;
-- Receive Only state transitioned from dirty to clean;
-- the monitor rearmed without waiting for the next 15-minute status check;
-- no unnecessary notification was generated for the clean transition.
+In both cases, Syncthing returned the folder to clean Receive Only state. These
+tests established that Revert Local Changes can restore the tested local
+divergence and that clean state is represented by
+`receiveOnlyTotalItems == 0`.
 
-**Result: PASS — event-assisted immediate rearming works.**
+The current monitor does not use an event-triggered recovery path. A folder is
+rearmed when a subsequent successful scheduled `/rest/db/status` observation
+reports `receiveOnlyTotalItems == 0`. Recovery is silent.
 
-## Existing File Local Modification
+**Result: PASS — Revert Local Changes restored the tested Receive Only
+divergence to clean state. Current rearming is polling-based.**
 
-A synchronized test file was first created on the authoritative source and allowed to synchronize normally to the NAS. The NAS baseline was verified clean.
+### Receive Only Notification Ownership
 
-The synchronized file was then modified directly on the NAS.
+Receive Only notification decisions are centralized in the count-based state
+transition evaluator used by scheduled status polling.
 
-Observed:
-
-- Syncthing promptly showed Receive Only divergence;
-- `/rest/db/status` reported one changed file;
-- no prompt `LocalChangeDetected` event was observed;
-- the scheduled database-status check detected the dirty state;
-- exactly one local-change notification was sent.
-
-**Result: PASS — local modification is detected through the authoritative database-status fallback.**
-
-## Receive Only Recovery After Local Modification
-
-The modified file was recovered using Syncthing's **Revert Local Changes**.
-
-Observed:
-
-- Syncthing emitted `LocalChangeDetected`;
-- the monitor immediately performed a targeted Receive Only check;
-- state transitioned from dirty to clean;
-- the folder was rearmed immediately.
-
-This reproduced the event-assisted recovery behavior previously observed after the local-addition test.
-
-**Result: PASS — v4 event-assisted rearming reproduced.**
-
-## Duplicate Notification Prevention
-
-Earlier monitor behavior allowed the event path and scheduled Receive Only check to independently notify about the same local-change incident.
-
-v4 changed the model so that `LocalChangeDetected` does not directly send an alert. Instead:
+The current transition model is:
 
 ```text
-LocalChangeDetected
-        |
-        v
-targeted Receive Only status check
-        |
-        v
-existing clean/dirty transition logic
-        |
-        v
-notification only on clean -> dirty
+no prior state -> 0     silent clean baseline
+no prior state -> >0    alert
+0 -> >0                 alert
+>0 -> larger            persist worsening; repeat-alert coalescing policy unresolved
+>0 -> same              silent
+>0 -> smaller but >0    silent partial recovery
+>0 -> 0                 silent recovery and rearm
+unknown observation     preserve previous state; do not infer recovery
 ```
 
-The scheduled status check uses the same state transition logic.
+Component-counter changes do not independently define worsening when
+`receiveOnlyTotalItems` is unchanged.
 
-**Result: PASS — Receive Only notification ownership is centralized in state transitions rather than duplicated between detection mechanisms.**
+**Result: PASS — automated regression coverage verifies the current count-based
+transition model and prevents duplicate ownership of Receive Only alerts.**
 
-A clean-to-dirty event-triggered alert was not directly observed during these tests because the tested local addition and local modification did not produce prompt `LocalChangeDetected` events.
+### Multiple Local Changes During One Divergent Period
 
-The event-triggered code path itself was directly exercised during dirty-to-clean recovery.
+The monitor's Receive Only detector is state-based rather than a per-file local
+change audit trail.
 
-## Multiple Local Changes During One Dirty Period
+Once a folder becomes divergent, additional local changes are represented by
+the observed Receive Only counters. A larger `receiveOnlyTotalItems` value is
+persisted as worsening; a smaller non-zero value is persisted as partial
+recovery. Full recovery to zero silently rearms the folder.
 
-The monitor's Receive Only detector is intentionally state-based.
+The minimum coalescing interval for a future repeat worsening notification
+remains unresolved, so the current implementation does not invent one.
 
-Once a folder transitions `clean -> dirty`, one incident notification is generated. Additional local changes while the folder remains dirty do not create additional state-transition notifications. After `dirty -> clean`, the detector rearms.
-
-**Result: Behavior confirmed by design and state-transition testing.**
-
-This is not intended to provide a per-file local-change audit trail.
+**Result: Behavior covered by the current count-based evaluator and regression
+tests.**
 
 ## Transient Divergence Limitation
 
-The Stage 2 Receive Only detector polls `/rest/db/status` every 60 seconds.
+The current Receive Only detector polls `/rest/db/status` every 60 seconds.
 
 A known architectural blind spot remains:
 
@@ -306,10 +287,10 @@ Pending notifications persisted in monitor state and survived container recreati
 
 **Result: PASS — transient notification failure does not discard queued notification state.**
 
-## Stage 2 Production Acceptance
+## Receive Only Production Baseline
 
-Stage 2 was deployed to the existing Synology monitor container without
-modifying production backup data.
+The count-based Receive Only implementation was deployed to the existing
+Synology monitor container without modifying production backup data.
 
 Before deployment, all four monitored Receive Only folders reported a clean
 state through `/rest/db/status`:
@@ -326,7 +307,7 @@ receiveOnlyTotalItems=0
 The persisted pre-Stage-2 state contained legacy Boolean `false` values for
 all four Receive Only folders.
 
-After container recreation with the Stage 2 implementation:
+After container recreation with the count-based implementation:
 
 - the monitor resumed the existing combined event stream after event ID 350;
 - each legacy Boolean Receive Only value was replaced with structured
@@ -343,13 +324,13 @@ No production Receive Only divergence was manufactured for this acceptance
 test. Dirty-state transition behavior is covered by the automated evaluator
 and integration tests rather than by modifying production backup data.
 
-**Result: PASS — Stage 2 clean-state migration and production polling
-configuration verified without modifying protected backup data.**
+**Result: PASS — clean-state migration and production polling configuration
+verified without modifying protected backup data.**
 
-## Stage 4 Backup Verification
+## Backup Verification
 
-Stage 4 extended the monitor beyond Receive Only divergence and remote-deletion
-audit by adding periodic verification of configuration integrity, folder health,
+The monitor extends beyond Receive Only divergence and remote-deletion audit
+with periodic verification of configuration integrity, folder health,
 authoritative-source connectivity, and complete-cycle API health.
 
 The authoritative source is derived from Syncthing topology rather than from a
@@ -360,7 +341,7 @@ remote device, or multiple remote devices causes authoritative-source
 verification to fail. Each protected folder is then checked independently for
 membership of the derived authoritative device.
 
-Stage 4 automated regression coverage verifies:
+Automated regression coverage verifies:
 
 - authoritative-device derivation from Syncthing topology;
 - rejection of missing, zero-remote, and multiple-remote device topologies;
@@ -384,13 +365,10 @@ Stage 4 automated regression coverage verifies:
 - state normalization adds the Stage 4 configuration, folder-health,
   source-connectivity, and API-health state categories.
 
-At completion of Stage 4 and its corrective topology change, the complete
-regression suite contained 108 passing tests.
-
 ### Receive Only API-response hardening
 
-Post-Stage-4 review identified a fail-open condition in Receive Only status
-parsing. A successful `/rest/db/status` response that omitted a required
+Review identified a fail-open condition in Receive Only status parsing. A
+successful `/rest/db/status` response that omitted a required
 Receive Only counter could previously default that counter to zero. In
 particular, a missing `receiveOnlyTotalItems` value could incorrectly turn a
 previously dirty observation into a clean one.
@@ -411,10 +389,10 @@ Regression coverage verifies that:
 After this hardening, the complete regression suite contains 110 passing
 tests.
 
-### Stage 4 Production Validation
+### Production Backup-Verification Validation
 
-Stage 4 was validated against the running Synology deployment using controlled
-changes that did not modify protected backup data.
+Backup verification was validated against the running Synology deployment
+using controlled changes that did not modify protected backup data.
 
 Configuration-integrity validation temporarily disabled **Watch for Changes**
 for the `documents` folder. Syncthing then reported
@@ -452,8 +430,8 @@ as API observation failures.
 **Result: PASS — successful complete verification cycles preserve/reset the API
 failure streak as designed.**
 
-The following Stage 4 policy questions remain intentionally unresolved and are
-not established by this acceptance record:
+The following policy questions remain intentionally unresolved and are not
+established by this acceptance record:
 
 - API-health alert threshold;
 - exact API-health logging semantics;
@@ -465,34 +443,6 @@ not established by this acceptance record:
 The monitor also cannot detect its own failure. Complete monitor-health coverage
 requires an external heartbeat or dead-man mechanism, which is outside the
 current implementation.
-
-## Pre-Stage-2 Production Acceptance State
-
-The following records the production configuration and behavior verified before
-the Stage 2 Receive Only redesign. It is retained as historical acceptance
-evidence and does not describe the current Stage 2 implementation.
-
-At completion of functional testing:
-
-```text
-STATUS_INTERVAL=900
-RESTART_CHECK_INTERVAL=60
-REMOTE_DELETE_THRESHOLD=50
-REMOTE_DELETE_WINDOW=300
-TZ=Pacific/Honolulu
-```
-
-The production monitor:
-
-- starts successfully;
-- resumes persisted event state;
-- detects persistent Receive Only divergence;
-- avoids repeated alerts while a folder remains dirty;
-- rearms after recovery;
-- uses events opportunistically for faster checks;
-- detects suspicious remote mass-file-deletion bursts;
-- persists notification retry state;
-- performs no automatic recovery or destructive action.
 
 ## Acceptance Conclusion
 
