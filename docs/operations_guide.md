@@ -7,12 +7,15 @@ The Syncthing Integrity Monitor runs continuously alongside Syncthing.
 Normal operation consists of:
 
 - consuming Syncthing's combined event stream;
-- periodically checking Receive Only folder state;
-- maintaining persistent event and incident state;
+- periodically running the backup-verification cycle;
+- checking Receive Only state, configuration integrity, and folder health;
+- observing authoritative-source connectivity and API health;
+- maintaining persistent event, incident, and verification state;
 - detecting bursts of remote file deletions;
 - sending notifications when configured conditions are met.
 
-No operator action is required while all monitored folders remain clean and no suspicious remote deletion burst occurs.
+No operator action is required while the monitored backup state remains healthy
+and no alert condition requires investigation.
 
 ## Check Container Status
 
@@ -53,9 +56,77 @@ This is a manual recovery action. The integrity monitor never performs it automa
 Once Syncthing returns the folder to clean Receive Only state, the next
 successful `/rest/db/status` poll observes `receiveOnlyTotalItems == 0`.
 The monitor then silently rearms the folder so that a future divergence can
-generate a new initial alert. With the production 60-second polling interval,
-this normally occurs within roughly one polling interval after Syncthing
-discovers the recovery.
+generate a new initial alert. With `STATUS_INTERVAL=60`, rearming occurs on the
+next verification cycle after Syncthing discovers the recovery; main-loop work
+can delay that cycle beyond 60 seconds.
+
+## Configuration Integrity Alert
+
+A `[Syncthing] configuration integrity violation` notification means that one
+or more protected folders no longer matches the backup configuration expected
+by the monitor.
+
+The monitor requires each protected folder to be Receive Only, unpaused, using
+filesystem watching, and configured with Staggered File Versioning with
+`maxAge=31536000`. Each protected folder must also include the authoritative
+device derived from Syncthing's configured topology.
+
+### Investigation
+
+Review the violations listed in the notification and compare the affected
+folder's Syncthing configuration with the required protection settings.
+
+Do not automatically change the configuration merely to clear the alert.
+Determine why the setting changed and whether the change was intentional
+before restoring the expected configuration.
+
+The monitor reports configuration violations but never repairs them
+automatically.
+
+## Folder Health Alert
+
+A `[Syncthing] folder health violation` notification means that Syncthing
+reports an operational problem with one or more protected folders.
+
+The monitor treats a folder as unhealthy when `/rest/db/status` reports
+`state=error`, when `watchError` is non-empty, or when `/rest/folder/errors`
+reports one or more errors.
+
+### Investigation
+
+Review the violations listed in the notification and inspect the affected
+folder in Syncthing. Determine whether Syncthing reports a folder error,
+filesystem-watcher problem, or specific file-level errors before making
+changes.
+
+The monitor reports folder-health violations but never repairs them
+automatically.
+
+## Source Connectivity Monitoring
+
+The monitor observes whether the authoritative source device is connected and
+persists connectivity transitions. The authoritative device is derived from
+Syncthing's configured topology rather than from a configured device name.
+
+Source-connectivity alerting is intentionally disabled during the current
+observation period. A source disconnect or reconnect is therefore recorded in
+monitor state and logs but does not generate a notification.
+
+The alert threshold remains unresolved and is not hardcoded.
+
+## API Health Monitoring
+
+API health is evaluated once per complete backup-verification cycle. A cycle
+includes Receive Only, configuration-integrity, folder-health, and
+source-connectivity checks.
+
+If any required observation fails, the consecutive-failure streak increments
+once for that cycle, regardless of how many individual API operations failed.
+A completely successful verification cycle resets the streak to zero.
+
+The API-health alert threshold remains unresolved and is not hardcoded. The
+failure streak is persisted for observation, but API-health notifications are
+not currently generated.
 
 ## Remote Mass-Deletion Alert
 
@@ -91,7 +162,10 @@ Persistent state is stored at:
 state/monitor-state.json
 ```
 
-The state file contains the last processed event ID, Syncthing process start time, Receive Only state, remote-delete incident state, and pending notifications.
+The state file contains the last processed event ID, Syncthing process start
+time, Receive Only state, remote-delete incident state, configuration-integrity
+state, folder-health state, source-connectivity state, the API-health
+consecutive-failure streak, and pending notifications.
 
 Do not routinely delete this file. Deleting it causes the monitor to establish a new baseline on startup rather than continuing from its previous event cursor.
 
@@ -161,7 +235,10 @@ REMOTE_DELETE_THRESHOLD=50
 REMOTE_DELETE_WINDOW=300
 ```
 
-Notification retry behavior is controlled by `NOTIFY_RETRY_INTERVAL`.
+Notification delivery uses a persistent FIFO queue. At most one queued
+notification is attempted per `NOTIFY_RETRY_INTERVAL`. If delivery fails, that
+notification remains at the head of the queue for a later retry, so subsequent
+notifications are not attempted until it is successfully delivered.
 
 ## Secrets
 
@@ -182,7 +259,10 @@ additions and modifications in Receive Only database state without emitting a
 prompt `LocalChangeDetected` event. The monitor therefore uses
 `/rest/db/status` as the sole Receive Only detection mechanism.
 
-The monitor polls every monitored folder every 60 seconds.
+The monitor uses `STATUS_INTERVAL=60` as the configured interval for checking
+monitored folders. Because the main loop also performs a long-polling event
+request, verification cycles are not guaranteed to begin exactly every 60
+seconds.
 
 ### Revert clears the folder
 
@@ -201,8 +281,9 @@ may not reflect that change until Syncthing discovers it by another mechanism,
 potentially including a later full rescan. The production folders currently
 use a 3600-second rescan interval.
 
-The 60-second polling interval controls how frequently the monitor observes
-Syncthing's database state; it does not guarantee that Syncthing discovers
+The configured 60-second polling interval controls the minimum elapsed time
+between verification cycles; actual observations may occur later because of
+other main-loop work. It also does not guarantee that Syncthing discovers
 every filesystem change within 60 seconds.
 
 These are known limitations of the current design.
