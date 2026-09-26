@@ -312,6 +312,102 @@ class ReceiveOnlyEvaluatorTests(unittest.TestCase):
         )
         save.assert_called_once_with(state)
 
+    def test_missing_required_receive_only_counter_preserves_last_known_state(self):
+        folder_id = "test-folder"
+        previous = {
+            "receiveOnlyChangedFiles": 4,
+            "receiveOnlyChangedDirectories": 0,
+            "receiveOnlyChangedSymlinks": 0,
+            "receiveOnlyChangedDeletes": 0,
+            "receiveOnlyChangedBytes": 100,
+            "receiveOnlyTotalItems": 4,
+            "lastObservedCount": 4,
+            "lastAlertedCount": 4,
+            "lastAlertTime": "2026-09-24T20:00:00+00:00",
+        }
+
+        for missing_counter in monitor.RECEIVE_ONLY_COUNTERS:
+            with self.subTest(missing_counter=missing_counter):
+                state = {
+                    "receiveOnly": {
+                        folder_id: previous.copy(),
+                    },
+                    "pendingNotifications": [],
+                }
+
+                incomplete_status = observation(
+                    4,
+                    receiveOnlyChangedFiles=4,
+                    receiveOnlyChangedBytes=100,
+                )
+                del incomplete_status[missing_counter]
+
+                with patch.object(
+                    monitor,
+                    "FOLDERS",
+                    {folder_id: "Test Folder"},
+                ):
+                    with patch.object(
+                        monitor,
+                        "api",
+                        return_value=incomplete_status,
+                    ):
+                        with patch.object(monitor, "atomic_save") as save:
+                            succeeded = monitor.check_receive_only(state)
+
+                self.assertIs(succeeded, False)
+                self.assertEqual(
+                    state["receiveOnly"][folder_id],
+                    previous,
+                )
+                self.assertEqual(state["pendingNotifications"], [])
+                save.assert_not_called()
+
+    def test_null_required_receive_only_counter_preserves_last_known_state(self):
+        folder_id = "test-folder"
+        previous = {
+            "receiveOnlyChangedFiles": 4,
+            "receiveOnlyChangedDirectories": 0,
+            "receiveOnlyChangedSymlinks": 0,
+            "receiveOnlyChangedDeletes": 0,
+            "receiveOnlyChangedBytes": 100,
+            "receiveOnlyTotalItems": 4,
+            "lastObservedCount": 4,
+            "lastAlertedCount": 4,
+            "lastAlertTime": "2026-09-24T20:00:00+00:00",
+        }
+        state = {
+            "receiveOnly": {
+                folder_id: previous.copy(),
+            },
+            "pendingNotifications": [],
+        }
+
+        malformed_status = observation(
+            4,
+            receiveOnlyChangedFiles=0,
+            receiveOnlyChangedBytes=0,
+        )
+        malformed_status["receiveOnlyTotalItems"] = None
+
+        with patch.object(
+            monitor,
+            "FOLDERS",
+            {folder_id: "Test Folder"},
+        ):
+            with patch.object(
+                monitor,
+                "api",
+                return_value=malformed_status,
+            ):
+                with patch.object(monitor, "atomic_save") as save:
+                    succeeded = monitor.check_receive_only(state)
+
+        self.assertIs(succeeded, False)
+        self.assertEqual(state["receiveOnly"][folder_id], previous)
+        self.assertEqual(state["pendingNotifications"], [])
+        save.assert_not_called()
+
     def test_status_api_failure_preserves_last_known_state(self):
         folder_id = "test-folder"
         previous = {

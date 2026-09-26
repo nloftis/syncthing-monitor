@@ -593,8 +593,20 @@ RECEIVE_ONLY_COUNTERS = (
 
 def ro_status(fid):
     status = api("/rest/db/status", {"folder": fid}, timeout=15)
+
+    missing = [
+        key
+        for key in RECEIVE_ONLY_COUNTERS
+        if key not in status
+    ]
+    if missing:
+        raise ValueError(
+            "status response missing required Receive Only counters: "
+            + ", ".join(missing)
+        )
+
     return {
-        key: int(status.get(key, 0) or 0)
+        key: int(status[key])
         for key in RECEIVE_ONLY_COUNTERS
     }
 

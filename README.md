@@ -2,10 +2,12 @@
 
 A lightweight notification monitor for a Syncthing-based backup workflow using **Receive Only folders** on a Synology NAS.
 
-The monitor watches for two classes of events:
+The monitor watches four aspects of backup integrity and operational health:
 
-1. **Unexpected local changes on the NAS** that cause a Receive Only folder to diverge from its authoritative source.
-2. **Bursts of remote file deletions** that may indicate an accidental or destructive deletion event on an authoritative source.
+1. **Receive Only divergence** caused by unexpected local changes on the NAS.
+2. **Bursts of remote file deletions** that may indicate an accidental or destructive deletion event on the authoritative source.
+3. **Backup health and configuration integrity**, including folder health, filesystem-watcher status, Receive Only mode, versioning, and authoritative-device membership.
+4. **Operational verification health**, including authoritative-source connectivity and consecutive failures of complete backup-verification cycles.
 
 The monitor is intentionally **notification-only**. It does not revert files, stop Syncthing, delete files, or perform automated recovery.
 
@@ -19,7 +21,9 @@ This complements Receive Only replication and file versioning without turning an
 
 ## Protection Model
 
-In this environment, designated source systems are authoritative.
+In this environment, exactly one remote Syncthing device is authoritative.
+The monitor derives that device from Syncthing's configured device topology
+rather than from a configured display name.
 
 The Synology NAS receives those files through Syncthing folders configured as:
 
@@ -38,7 +42,7 @@ It is **not itself a backup system**. Syncthing provides replication and file ve
 The monitor runs as a small Python container alongside Syncthing on the Synology NAS.
 
 ```text
-Authoritative systems
+Authoritative source
         |
         | Syncthing
         v
@@ -59,11 +63,20 @@ Authoritative systems
 +---------------------------+
 ```
 
-The runtime monitor uses two independent mechanisms.
+The runtime monitor combines two detection paths with periodic backup-health
+verification:
+
+- `/rest/db/status` polling detects persistent Receive Only divergence.
+- The Syncthing event stream provides path-level remote-deletion audit data.
+- Periodic REST checks verify protected-folder configuration and folder health.
+- Source-connectivity state is observed and persisted for operational evidence.
+- Each complete verification cycle records whether all required Syncthing
+  observations succeeded, providing a consecutive API-failure streak.
 
 Automated regression coverage lives under `tests/` and exercises configuration,
-state persistence, notification handling, Receive Only evaluation, and event
-processing independently of the deployed container.
+state persistence, notification handling, Receive Only evaluation, remote-delete
+event processing, folder health, source connectivity, and backup-verification
+cycle behavior independently of the deployed container.
 
 ### Receive Only state polling
 
@@ -83,10 +96,15 @@ STATUS_INTERVAL=60
 ```
 
 Testing on the DS224+ measured idle `/rest/db/status` calls at approximately
-0.0012–0.0013 seconds each. A stress test at roughly 240 calls per minute,
-about 60 times the proposed production request rate, showed no concerning
-sustained idle load. Status-call cost during active synchronization remains
-unresolved.
+0.0012–0.0013 seconds each. A stress test at roughly 240 status calls per
+minute showed no concerning sustained idle load.
+
+The current verification cycle makes two `/rest/db/status` calls per monitored
+folder: one for Receive Only divergence and one for folder health. With four
+folders and a 60-second verification interval, that is approximately eight
+status calls per minute, so the stress test exercised roughly 30 times the
+current production status-call rate. Status-call cost during active
+synchronization remains unresolved.
 
 ### Syncthing event stream
 
@@ -106,6 +124,57 @@ configured monitored set are ignored.
 Events are not used to determine Receive Only divergence. They are retained
 for remote-deletion audit information that `/rest/db/status` does not
 provide.
+
+## Backup Health and Configuration Verification
+
+Each periodic verification cycle checks the protected Syncthing folders
+without modifying their configuration.
+
+For configuration integrity, each protected folder is expected to have:
+
+- folder type `receiveonly`;
+- `paused=false`;
+- `fsWatcherEnabled=true`;
+- staggered file versioning;
+- versioning `maxAge="31536000"` (365 days);
+- the derived authoritative device present in the folder's device list.
+
+The authoritative device is derived from Syncthing's configured topology.
+The local device ID is obtained from `/rest/system/status`, and the monitor
+requires exactly one other device in `/rest/config/devices`. A missing local
+device, no remote device, or multiple remote devices makes authoritative-source
+verification fail.
+
+A protected folder that omits the otherwise valid authoritative device is
+reported as a configuration-integrity violation.
+
+Folder health is checked using `/rest/db/status` and `/rest/folder/errors`.
+The monitor treats a folder as unhealthy when Syncthing reports an error
+state, a non-empty filesystem-watcher error, or folder errors.
+
+Configuration and folder-health violations are notification-only conditions.
+The monitor does not repair configuration or protected data automatically.
+
+### Source connectivity
+
+The monitor observes whether the authoritative source is connected and persists
+connectivity transitions. Diagnostic connection timestamps and durations are
+not persisted merely because they change.
+
+Source-connectivity alerting is intentionally disabled during the observation
+period. The alert threshold remains unresolved and is not hardcoded.
+
+### API health
+
+API health is evaluated once per complete backup-verification cycle. A cycle
+includes Receive Only, configuration-integrity, folder-health, and
+source-connectivity checks.
+
+If any required observation fails, the consecutive-failure streak increments
+once for that cycle, regardless of how many individual API operations failed.
+A completely successful verification cycle resets the streak to zero.
+
+The API-health alert threshold remains unresolved and is not hardcoded.
 
 ## Receive Only Detection
 
@@ -197,7 +266,9 @@ REMOTE_DELETE_WINDOW=300
 
 This represents **50 remote file deletions within a rolling 300-second window**.
 
-When the threshold is crossed, the monitor sends one high-priority notification for that deletion incident.
+When the threshold is crossed, the monitor sends one notification for that
+deletion incident. The email subject identifies the event as `HIGH`, but the
+notifier does not set email priority headers.
 
 It continues counting subsequent qualifying deletions and can provide the complete incident count when the deletion burst becomes quiet.
 
@@ -250,6 +321,16 @@ itself discovers every filesystem change within 60 seconds.
 The monitor should be considered an integrity-warning mechanism, not a
 complete filesystem audit system.
 
+## Important Limitation: Monitor Availability
+
+The monitor can record verification failures while it is running, but it
+cannot detect or report its own failure. If the monitor process or container
+stops, its internal API-health tracking also stops.
+
+Complete monitor-health coverage therefore requires an external heartbeat or
+dead-man mechanism. That external monitoring is not currently implemented by
+this project.
+
 ## Recovery
 
 Recovery is deliberately manual.
@@ -280,8 +361,12 @@ The state includes information such as:
 
 - Syncthing process start time
 - Last processed combined event ID
-- Receive Only dirty/clean state
+- Receive Only observations and alert state
 - Active remote-delete incidents
+- Configuration-integrity observations
+- Folder-health observations
+- Authoritative-source connectivity state
+- Consecutive backup-verification API failures
 - Pending notifications
 
 State is written atomically.
@@ -413,9 +498,17 @@ STATUS_INTERVAL=60
 
 The Syncthing API key and SMTP credentials are secrets.
 
-They belong only in `.env` or another appropriate secret-management mechanism and must not be committed to Git.
+They belong only in `.env` or another appropriate secret-management mechanism
+and must not be committed to Git.
 
-The monitor requires access to the Syncthing REST API but does not require write access to the protected Syncthing data directories.
+The Syncthing API key is a privileged credential, not a read-only monitoring
+token. Syncthing's REST API can perform administrative actions, so the key must
+be protected even though this monitor uses it only for observation.
+
+The monitor does not require filesystem write access to the protected Syncthing
+data directories. Running the container with filesystem least privilege reduces
+its direct access to backup data, but does not reduce the privileges carried by
+the Syncthing API credential.
 
 The supplied Compose configuration runs the container as UID/GID `1027:100`,
 which corresponds to the dedicated `svc-docker:users` account on the system

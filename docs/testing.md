@@ -26,23 +26,6 @@ Stage 1 coverage includes:
 - notification queue ordering and retry behavior;
 - event-batch ordering, cursor advancement, persistence, and failure handling.
 
-Stage 3 deliberately replaces the Stage 1 per-event persistence behavior.
-Event batches are now processed in memory and persisted once after the batch.
-
-Stage 3 automated coverage verifies:
-
-- ordered event-batch processing and once-per-batch persistence;
-- malformed event payloads are skipped without blocking later valid events;
-- only monitored-folder `RemoteChangeDetected` file deletions are eligible;
-- remote additions, modifications, and directory deletions are ignored;
-- the rolling deletion window excludes events older than the configured window;
-- threshold crossing sends one initial incident notification;
-- post-threshold deletions contribute to the final incident count;
-- wall-clock quiet-period checks close active incidents;
-- normal monitor restart preserves persisted active-incident state;
-- Syncthing restart closes an active incident with its persisted pre-restart
-  count before resetting the event baseline.
-
 Stage 2 adds automated coverage for the count-based Receive Only evaluator and
 its integration with status polling.
 
@@ -60,6 +43,23 @@ Stage 2 Receive Only coverage includes:
 - preservation of the last known state when `/rest/db/status` fails;
 - migration of legacy Boolean Receive Only state;
 - preservation of structured Stage 2 Receive Only state.
+
+Stage 3 deliberately replaces the Stage 1 per-event persistence behavior.
+Event batches are now processed in memory and persisted once after the batch.
+
+Stage 3 automated coverage verifies:
+
+- ordered event-batch processing and once-per-batch persistence;
+- malformed event payloads are skipped without blocking later valid events;
+- only monitored-folder `RemoteChangeDetected` file deletions are eligible;
+- remote additions, modifications, and directory deletions are ignored;
+- the rolling deletion window excludes events older than the configured window;
+- threshold crossing sends one initial incident notification;
+- post-threshold deletions contribute to the final incident count;
+- wall-clock quiet-period checks close active incidents;
+- normal monitor restart preserves persisted active-incident state;
+- Syncthing restart closes an active incident with its persisted pre-restart
+  count before resetting the event baseline.
 
 The tests use a sanitized `/rest/db/status` fixture captured from the actual
 Syncthing 2.0.10 deployment for the clean response shape. Divergent
@@ -210,7 +210,7 @@ Remote mass-deletion testing verified that the detector:
 - counts only `type=file`;
 - excludes directory deletion events;
 - uses event timestamps for the rolling window;
-- sends one high-priority notification when the threshold is crossed;
+- sends one notification when the threshold is crossed (the subject contains `HIGH`; no email priority headers are set);
 - continues tracking the full incident after threshold crossing;
 - produces the complete incident count when the burst closes;
 - persists notification retry state;
@@ -345,6 +345,126 @@ and integration tests rather than by modifying production backup data.
 
 **Result: PASS — Stage 2 clean-state migration and production polling
 configuration verified without modifying protected backup data.**
+
+## Stage 4 Backup Verification
+
+Stage 4 extended the monitor beyond Receive Only divergence and remote-deletion
+audit by adding periodic verification of configuration integrity, folder health,
+authoritative-source connectivity, and complete-cycle API health.
+
+The authoritative source is derived from Syncthing topology rather than from a
+display name. The monitor obtains the local device ID from
+`/rest/system/status`, excludes that ID from `/rest/config/devices`, and requires
+exactly one remaining configured device. Missing local-device membership, no
+remote device, or multiple remote devices causes authoritative-source
+verification to fail. Each protected folder is then checked independently for
+membership of the derived authoritative device.
+
+Stage 4 automated regression coverage verifies:
+
+- authoritative-device derivation from Syncthing topology;
+- rejection of missing, zero-remote, and multiple-remote device topologies;
+- protected-folder configuration invariants: `receiveonly`, `paused=false`,
+  `fsWatcherEnabled=true`, staggered versioning, `maxAge="31536000"`, and
+  authoritative-device membership;
+- configuration violations are distinguished from observation/API failures;
+- folder-health observation through `/rest/db/status` and
+  `/rest/folder/errors`;
+- initial clean folder health is silent, initial unhealthy state alerts,
+  clean-to-unhealthy transition alerts, and unchanged unhealthy state is silent;
+- source-connectivity observation and persistence without connectivity
+  notifications during the current observation period;
+- changing diagnostic connection timestamps or durations alone does not mutate
+  persisted connectivity state;
+- observation failure preserves the last known connectivity state;
+- one API-health failure-streak increment per failed complete verification
+  cycle, regardless of how many component observations fail;
+- a completely successful verification cycle resets the API-health failure
+  streak to zero;
+- state normalization adds the Stage 4 configuration, folder-health,
+  source-connectivity, and API-health state categories.
+
+At completion of Stage 4 and its corrective topology change, the complete
+regression suite contained 108 passing tests.
+
+### Receive Only API-response hardening
+
+Post-Stage-4 review identified a fail-open condition in Receive Only status
+parsing. A successful `/rest/db/status` response that omitted a required
+Receive Only counter could previously default that counter to zero. In
+particular, a missing `receiveOnlyTotalItems` value could incorrectly turn a
+previously dirty observation into a clean one.
+
+The parser now requires all six Receive Only counters to be present and
+integer-convertible. Missing or malformed required values cause the folder
+status check to fail rather than being interpreted as zero. The previous
+Receive Only state is preserved so an unknown observation cannot clear a
+known dirty state.
+
+Regression coverage verifies that:
+
+- omission of any of the six required Receive Only counters fails closed;
+- a present but null required counter fails closed;
+- the previously persisted Receive Only state remains unchanged;
+- no state save or notification is produced from the invalid observation.
+
+After this hardening, the complete regression suite contains 110 passing
+tests.
+
+### Stage 4 Production Validation
+
+Stage 4 was validated against the running Synology deployment using controlled
+changes that did not modify protected backup data.
+
+Configuration-integrity validation temporarily disabled **Watch for Changes**
+for the `documents` folder. Syncthing then reported
+`fsWatcherEnabled=false`; the monitor persisted the configuration violation and
+a notification email was delivered. After Watch for Changes was restored, the
+monitor observed `fsWatcherEnabled=true` and cleared the violation.
+
+**Result: PASS — a real protected-folder configuration violation was detected,
+persisted, and notified without automatic repair.**
+
+Folder-health validation used the live `documents` folder without manufacturing
+a destructive fault. `/rest/db/status` reported an idle state with empty
+`error` and `watchError` values and zero errors, while `/rest/folder/errors`
+reported no folder errors.
+
+**Result: PASS within the safe-production validation boundary — the live healthy
+folder was observed correctly. Deliberately creating a production folder fault
+was not required.**
+
+Source-connectivity validation paused the authoritative source device. Syncthing
+reported it disconnected and paused; the monitor persisted
+`connected=false` and logged the transition. After the source was resumed, the
+monitor persisted `connected=true` and logged recovery. No connectivity
+notification was expected because source-connectivity alerting remains
+intentionally disabled during the observation period.
+
+**Result: PASS — authoritative-source connectivity transitions were observed and
+persisted without enabling an unresolved alert policy.**
+
+During valid configuration and connectivity transitions,
+`apiHealth.consecutiveFailures` remained zero. This confirms that successfully
+observed configuration violations or connectivity-state changes are not treated
+as API observation failures.
+
+**Result: PASS — successful complete verification cycles preserve/reset the API
+failure streak as designed.**
+
+The following Stage 4 policy questions remain intentionally unresolved and are
+not established by this acceptance record:
+
+- API-health alert threshold;
+- exact API-health logging semantics;
+- source-connectivity alert threshold;
+- whether or how `lastSeen` should advance during a long-lived connection;
+- configuration-violation change and recovery notification policy;
+- folder-health change and recovery notification policy.
+
+The monitor also cannot detect its own failure. Complete monitor-health coverage
+requires an external heartbeat or dead-man mechanism, which is outside the
+current implementation.
 
 ## Pre-Stage-2 Production Acceptance State
 
