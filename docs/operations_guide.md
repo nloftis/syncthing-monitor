@@ -188,7 +188,7 @@ available for inspection. On the production Synology deployment, stop the
 restart loop and move the invalid file aside:
 
 ~~~bash
-cd /volume1/docker/synology-monitor && \
+cd /volume1/docker/syncthing-monitor && \
 sudo docker compose stop syncthing-monitor && \
 mv state/monitor-state.json "state/monitor-state.json.corrupt-$(date +%Y%m%d-%H%M%S)"
 ~~~
