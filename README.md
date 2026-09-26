@@ -101,10 +101,12 @@ minute showed no concerning sustained idle load.
 
 The current verification cycle makes two `/rest/db/status` calls per monitored
 folder: one for Receive Only divergence and one for folder health. With four
-folders and a 60-second verification interval, that is approximately eight
-status calls per minute, so the stress test exercised roughly 30 times the
-current production status-call rate. Status-call cost during active
-synchronization remains unresolved.
+folders and `STATUS_INTERVAL=60`, the configured polling rate is approximately
+eight status calls per minute, so the stress test exercised roughly 30 times
+that configured status-call rate. Because the main loop also performs a
+long-polling event request, verification cycles are not guaranteed to begin
+exactly every 60 seconds. Status-call cost during active synchronization
+remains unresolved.
 
 ### Syncthing event stream
 
@@ -117,9 +119,10 @@ RemoteChangeDetected
 The event cursor is persisted across monitor restarts.
 
 Event batches are processed in memory and persisted once after the batch.
-Malformed event payloads are logged and skipped so that a single bad event
-does not indefinitely block later events. Events for folders outside the
-configured monitored set are ignored.
+Invalid `RemoteChangeDetected` data encountered during event processing is
+logged and skipped so that a bad event payload does not indefinitely block
+later events. Event cursor advancement still requires a valid event ID.
+Events for folders outside the configured monitored set are ignored.
 
 Events are not used to determine Receive Only divergence. They are retained
 for remote-deletion audit information that `/rest/db/status` does not
@@ -175,6 +178,8 @@ once for that cycle, regardless of how many individual API operations failed.
 A completely successful verification cycle resets the streak to zero.
 
 The API-health alert threshold remains unresolved and is not hardcoded.
+The consecutive-failure streak is persisted for observation, but API-health
+notifications are not currently generated.
 
 ## Receive Only Detection
 
