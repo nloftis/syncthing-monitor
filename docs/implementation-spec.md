@@ -818,14 +818,21 @@ Source-connectivity and API-health threshold notifications remain
 intentionally disabled because their policy thresholds have not been
 selected.
 
-### Future operational assurance
+### Stage 5 --- Operational assurance
 
-Not currently implemented:
+-   explicit test-alert mechanism;
+-   choose/enable source-connectivity threshold from data;
+-   choose/enable API-failure threshold from data;
+-   add external dead-man/heartbeat monitoring as a separately scoped
+    feature.
 
--   source-connectivity threshold and notifications;
--   API-health threshold and notifications;
--   external dead-man/heartbeat monitoring;
--   optional explicit test-alert mechanism.
+After each stage:
+
+1.  run automated tests;
+2.  perform only the minimum necessary live integration tests;
+3.  update public documentation;
+4.  update the public repository;
+5.  deploy the validated version to production Container Manager.
 
 ------------------------------------------------------------------------
 
