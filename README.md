@@ -469,8 +469,10 @@ Startup fails if any of the following are missing or empty:
 - `FOLDERS`
 - `SMTP_USER`
 - `SMTP_PASSWORD`
-- `MAIL_FROM`
 - `MAIL_TO`
+
+If `MAIL_FROM` is unset, it defaults to `SMTP_USER`. If `MAIL_FROM` is
+explicitly set to an empty value, startup validation fails.
 
 `NOTIFY_METHOD` must currently be `email`.
 

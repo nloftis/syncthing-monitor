@@ -169,6 +169,52 @@ consecutive-failure streak, and pending notifications.
 
 Do not routinely delete this file. Deleting it causes the monitor to establish a new baseline on startup rather than continuing from its previous event cursor.
 
+### Corrupt or Invalid State
+
+If the state file cannot be loaded or validated, the monitor fails closed rather
+than treating the missing state as a clean backup condition. The container log
+reports a fatal error beginning with:
+
+~~~text
+fatal: Cannot load state file:
+~~~
+
+With the configured restart policy, the container may repeatedly restart and
+encounter the same error. No email notification is generated because the
+monitor cannot enter its normal monitoring loop.
+
+Preserve the invalid state file before taking recovery action so that it remains
+available for inspection. On the production Synology deployment, stop the
+restart loop and move the invalid file aside:
+
+~~~bash
+cd /volume1/docker/synology-monitor && \
+sudo docker compose stop syncthing-monitor && \
+mv state/monitor-state.json "state/monitor-state.json.corrupt-$(date +%Y%m%d-%H%M%S)"
+~~~
+
+Then restart the monitor:
+
+~~~bash
+sudo docker compose up -d syncthing-monitor
+~~~
+
+The monitor will create a fresh state file and establish a new event and
+verification baseline. Preserve the renamed corrupt file until the failure has
+been investigated.
+
+Resetting state has operational consequences:
+
+- a protected folder that is already Receive Only divergent at the first
+  successful observation is treated as an initial divergence and alerts again;
+- any active remote-deletion incident stored only in the discarded state is
+  lost and cannot be continued;
+- the previous combined-event cursor and other persisted monitoring history are
+  discarded.
+
+State reset should therefore be a deliberate recovery action, not a routine
+response to monitor startup failure.
+
 ## Fresh Deployment
 
 A new deployment does not require an existing monitor state file.
